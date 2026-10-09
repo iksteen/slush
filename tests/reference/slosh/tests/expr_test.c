@@ -1,0 +1,327 @@
+/* The shader expression compiler and its VM. Pure text in -> numbers out, so
+ * pure tests: no screen, no terminal, no timing. */
+#include "expr.h"
+
+#include <stdio.h>
+#include <string.h>
+
+static int fails = 0;
+static char detail[256];
+
+static void ok(const char *name, bool cond, const char *what) {
+  if (!cond) fails++;
+  printf("%s %-56s %s\n", cond ? "ok  " : "FAIL", name, cond ? "" : what);
+}
+
+/* Evaluate at a fixed point, so a test says what it means about the maths. */
+static int at(const char *src, int x, int y) {
+  char err[128] = {0};
+  expr_prog_t *p = expr_compile(src, err, sizeof err);
+  if (!p) {
+    snprintf(detail, sizeof detail, "%s: %s", src, err);
+    return -99999;
+  }
+  expr_env_t env = {.x = x,
+                    .y = y,
+                    .cols = 80,
+                    .rows = 24,
+                    .curx = 10,
+                    .cury = 5,
+                    .cursor = 1,
+                    .focused = 1,
+                    .t = 1000,
+                    .since = 250};
+  int v = expr_eval(p, &env);
+  expr_free(p);
+  return v;
+}
+
+static void eq(const char *src, int want) {
+  int got = at(src, 3, 4);
+  if (got != want)
+    snprintf(detail, sizeof detail, "%s -> %d, wanted %d", src, got, want);
+  ok(src, got == want, detail);
+}
+
+static void refused(const char *label, const char *src) {
+  char err[128] = {0};
+  expr_prog_t *p = expr_compile(src, err, sizeof err);
+  if (p) expr_free(p);
+  snprintf(detail, sizeof detail, "%s compiled", src);
+  ok(label, p == NULL && err[0] != 0, detail);
+}
+
+int main(void) {
+  printf("-- arithmetic and precedence\n");
+  eq("1 + 2 * 3", 7);
+  eq("(1 + 2) * 3", 9);
+  eq("10 - 3 - 2", 5); /* left-associative, not 9 */
+  eq("7 % 3", 1);
+  eq("-5 + 1", -4);
+  eq("100 / 7", 14); /* integer division, truncating */
+
+  printf("\n-- division by zero is defined, not a trap\n");
+  eq("5 / 0", 0);
+  eq("5 % 0", 0);
+  eq("1 + 5 / 0", 1);
+
+  printf("\n-- comparisons and logic produce 0 or 1\n");
+  eq("3 < 4", 1);
+  eq("4 < 3", 0);
+  eq("3 <= 3", 1);
+  eq("3 >= 4", 0);
+  eq("3 == 3", 1);
+  eq("3 != 3", 0);
+  eq("1 && 0", 0);
+  eq("1 || 0", 1);
+  eq("!0", 1);
+  eq("!5", 0);
+  /* The reason comparisons return numbers: masking is how you write a rule. */
+  eq("(3 < 4) * 200", 200);
+
+  printf("\n-- bitwise, on the 32-bit value\n");
+  eq("12 & 10", 8);
+  eq("12 | 10", 14);
+  eq("12 ^ 10", 6);
+  eq("~0", -1);
+  eq("~12", -13);
+  eq("1 << 4", 16);
+  eq("48 >> 2", 12);
+  /* `>>` keeps the sign, so it halves a negative rather than turning it into a
+   * large positive. Written out in the VM because C leaves it
+   * implementation-defined and JavaScript does not -- and the browser preview is
+   * JavaScript. */
+  eq("0 - 8 >> 1", -4);
+  eq("0 - 1 >> 28", -1);
+  /* The count is masked to five bits, which is what JS does with it: a shift
+   * nobody meant is defined rather than undefined. */
+  eq("1 << 33", 2);
+  eq("1 << 32", 1);
+  eq("8 >> 33", 4);
+  /* Bits bind tighter than comparison, unlike C, where `12 & 8 == 8` means
+   * `12 & (8 == 8)` and answers 0. Ritchie's own regret; not worth inheriting. */
+  eq("12 & 8 == 8", 1);
+  eq("5 ^ 3 == 6", 1);
+  /* And among themselves: & then ^ then |, as everywhere else. */
+  eq("1 | 6 & 4", 5);
+  eq("1 ^ 6 & 4", 5);
+  eq("3 & 1 | 4 & 4", 5);
+  /* `&&` and `||` still parse as themselves, one character longer. */
+  eq("1 & 3 && 2 & 1", 0);
+  eq("(1 & 3) && (2 & 2)", 1);
+  eq("0 | 0 || 1 & 1", 1);
+  /* The XOR texture, which is the reason to want any of this. */
+  eq("x ^ y", 7);
+  eq("(x ^ y) & 1", 1);
+
+  printf("\n-- sin and cos: degrees in, -255..255 out\n");
+  eq("sin(0)", 0);
+  eq("sin(30)", 127); /* round(255 * 0.5) is 127, not 128: 127.5 rounds down */
+  eq("sin(90)", 255);
+  eq("sin(180)", 0);
+  eq("sin(270)", -255);
+  eq("cos(0)", 255);
+  eq("cos(90)", 0);
+  eq("cos(180)", -255);
+  /* Symmetry, so the four quadrants are one curve and not four. */
+  eq("sin(45) - sin(135)", 0);
+  eq("sin(30) + sin(210)", 0);
+  eq("cos(60) - sin(30)", 0);
+  /* Any angle at all: wrapped, including negative ones, because `t / 4` does not
+   * stop at 360 and an expression that dies at one turn is no use for animation. */
+  eq("sin(360)", 0);
+  eq("sin(450)", 255);
+  eq("sin(0 - 90)", -255);
+  eq("sin(0 - 450)", -255);
+  eq("sin(36000 + 90)", 255);
+  /* The shape a strength actually wants: a breathe centred half way up, which is
+   * why the range is the same 255 the amounts use. */
+  eq("128 + sin(90) / 2", 255);
+  eq("128 + sin(270) / 2", 1); /* -255/2 truncates toward zero, so 128 - 127 */
+  eq("abs(sin(270))", 255);
+
+  printf("\n-- PI and TAU are angles, not numbers\n");
+  eq("PI", 180);
+  eq("TAU", 360);
+  eq("PI * 2 == TAU", 1);
+  /* The point of the pun: a formula written the radian way works as written. */
+  eq("sin(PI)", 0);
+  eq("sin(PI / 2)", 255);
+  eq("cos(TAU)", 255);
+  eq("sin(TAU * 3 / 4)", -255);
+  /* ...and exactly, which real radians could not manage in integers: a sixth of
+   * a turn is 30 whole degrees, where 3.14159 / 6 would be 0. */
+  eq("sin(PI / 6)", 127);
+  eq("sin(PI / 3)", 221);
+  eq("sin(PI / 4)", 180);
+  /* No conversions, because there is one unit and nothing to convert. */
+  refused("deg2rad is not a thing", "deg2rad(90)");
+  refused("nor rad2deg", "rad2deg(1)");
+
+  printf("\n-- variables\n");
+  eq("x", 3);
+  eq("y", 4);
+  eq("cols", 80);
+  eq("rows", 24);
+  eq("curx", 10);
+  eq("cury", 5);
+  eq("cursor", 1);
+  eq("focused", 1);
+  eq("t", 1000);
+  eq("since", 250);
+  /* What a flash is: full strength for a moment after the state began, then
+   * nothing. `t` cannot express this — it says what time it is, not how long
+   * ago something happened. */
+  eq("(since < 300) * 255", 255);
+  eq("(since < 200) * 255", 0);
+
+  printf("\n-- functions\n");
+  eq("min(3, 9)", 3);
+  eq("max(3, 9)", 9);
+  eq("abs(0 - 7)", 7);
+  eq("clamp(300, 0, 255)", 255);
+  eq("clamp(-5, 0, 255)", 0);
+  eq("clamp(100, 0, 255)", 100);
+  /* dist counts a row double, because a cell is about twice as tall as it is
+   * wide. Four columns apart is 4; two rows apart is also 4. */
+  eq("dist(0, 0, 4, 0)", 4);
+  eq("dist(0, 0, 0, 2)", 4);
+
+  printf("\n-- the ternary evaluates both sides and selects\n");
+  eq("1 ? 10 : 20", 10);
+  eq("0 ? 10 : 20", 20);
+  eq("0 ? 1 / 0 : 7", 7); /* the untaken side is safe because nothing traps */
+
+  printf("\n-- an expression that reads nothing is a constant\n");
+  {
+    char err[128] = {0};
+    expr_prog_t *p = expr_compile("2 * 3 + 1", err, sizeof err);
+    ok("it compiles", p != NULL, err);
+    ok("with no dependencies", p && expr_deps(p) == 0, "deps");
+    ok("folded at compile time", p && expr_constant(p) == 7, "value");
+    expr_free(p);
+  }
+
+  printf("\n-- dependencies are derived from the source, not declared\n");
+  {
+    struct {
+      const char *src;
+      unsigned want;
+    } cases[] = {
+        {"128", 0},
+        {"x * 2", EXPR_DEP_POS},
+        {"y", EXPR_DEP_POS},
+        {"cols / 2",
+         EXPR_DEP_SIZE}, /* not constant: the rect is not known yet */
+        {"dist(x, y, curx, cury)", EXPR_DEP_POS | EXPR_DEP_CURSOR},
+        {"focused * 90", EXPR_DEP_FOCUS},
+        {"t % 1000", EXPR_DEP_TIME},
+        {"since", EXPR_DEP_TIME}, /* a clock, so never cached */
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+      char err[128] = {0};
+      expr_prog_t *p = expr_compile(cases[i].src, err, sizeof err);
+      unsigned got = p ? expr_deps(p) : 0xffff;
+      snprintf(detail, sizeof detail, "%s -> %u, wanted %u", cases[i].src, got,
+               cases[i].want);
+      ok(cases[i].src, p && got == cases[i].want, detail);
+      expr_free(p);
+    }
+  }
+
+  printf("\n-- the map is the whole point: computed once, reused\n");
+  {
+    char err[128] = {0};
+    expr_prog_t *p = expr_compile("x + y", err, sizeof err);
+    expr_env_t env = {.cols = 8, .rows = 4};
+    uint8_t *m1 = NULL, *m2 = NULL;
+    ok("a positional program has a map", expr_amount_map(p, &env, &m1), err);
+    ok("with the right values", m1 && m1[0] == 0 && m1[8 * 1 + 2] == 3,
+       "values");
+    ok("asking again returns the same buffer",
+       expr_amount_map(p, &env, &m2) && m2 == m1, "buffer");
+
+    /* Resizing must rebuild it: the size is part of what it was computed from,
+     * and a map kept across a resize is the stale-state bug this design is
+     * supposed to make unrepresentable. */
+    env.cols = 4;
+    env.rows = 2;
+    ok("a different rect rebuilds it",
+       expr_amount_map(p, &env, &m2) && m2[4 * 1 + 1] == 2, "rebuild");
+    expr_free(p);
+  }
+
+  printf("\n-- a clock-reading program has nothing to reuse\n");
+  {
+    char err[128] = {0};
+    expr_prog_t *p = expr_compile("t % 255", err, sizeof err);
+    expr_env_t env = {.cols = 4, .rows = 2};
+    uint8_t *m = NULL;
+    ok("no map is offered", !expr_amount_map(p, &env, &m), "map");
+    expr_free(p);
+  }
+
+  printf("\n-- the cursor is part of the key\n");
+  {
+    char err[128] = {0};
+    expr_prog_t *p = expr_compile("dist(x, y, curx, cury)", err, sizeof err);
+    expr_env_t env = {.cols = 4, .rows = 2, .cursor = 1, .curx = 0, .cury = 0};
+    uint8_t *m = NULL;
+    expr_amount_map(p, &env, &m);
+    int before = m[3];
+    env.curx = 3;
+    expr_amount_map(p, &env, &m);
+    snprintf(detail, sizeof detail, "%d then %d", before, m[3]);
+    ok("moving the cursor rebuilds the map", m[3] != before, detail);
+    expr_free(p);
+  }
+
+  printf("\n-- what is refused, and says why\n");
+  refused("an unknown name", "nosuchvar + 1");
+  refused("an unknown function", "wobble(1, 2)");
+  refused("an unbalanced paren", "(1 + 2");
+  refused("a missing operand", "1 +");
+  refused("trailing junk", "1 + 2 )");
+  refused("an empty expression", "");
+  refused("a ternary without its colon", "1 ? 2");
+  refused("something that is not an expression at all", "@@@");
+
+  printf("\n-- the source survives compilation\n");
+  {
+    /* The dump has to write back the line somebody wrote: bytecode cannot be
+     * un-compiled, so the program keeps its text. Byte for byte, including a
+     * constant expression -- folding must not eat the spelling. */
+    const char *src = "(y % 2) * 40";
+    char err[128] = {0};
+    expr_prog_t *p = expr_compile(src, err, sizeof err);
+    ok("a program remembers its source",
+       p && expr_source(p) && strcmp(expr_source(p), src) == 0,
+       p ? expr_source(p) : err);
+    if (p) expr_free(p);
+    p = expr_compile("1 + 2", err, sizeof err);
+    ok("even one that folded to a constant",
+       p && expr_source(p) && strcmp(expr_source(p), "1 + 2") == 0,
+       p ? expr_source(p) : err);
+    if (p) expr_free(p);
+  }
+
+  printf("\n-- totality: there is no loop to write\n");
+  {
+    /* The language has no way to express unbounded work, so this is a
+     * statement about the grammar rather than a timing test: a deeply nested
+     * expression is bounded by the program length limit and is refused rather
+     * than accepted and run forever. */
+    char big[4096];
+    size_t n = 0;
+    for (int i = 0; i < 200; i++)
+      n += (size_t)snprintf(big + n, sizeof big - n, "1+");
+    snprintf(big + n, sizeof big - n, "1");
+    char err[128] = {0};
+    expr_prog_t *p = expr_compile(big, err, sizeof err);
+    if (p) expr_free(p);
+    ok("an over-long program is refused, not truncated", p == NULL, err);
+  }
+
+  printf("\n%s (%d failures)\n", fails ? "FAILED" : "all green", fails);
+  return fails ? 1 : 0;
+}

@@ -1,0 +1,7 @@
+required-version = "==0.16.3"
+target-version = "py39"
+line-length = 88
+extend-exclude = ["vendor", "tests/reference"]
+
+[lint]
+select = ["I"]

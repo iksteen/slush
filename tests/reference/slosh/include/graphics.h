@@ -1,0 +1,117 @@
+/* Kitty graphics passthrough.
+ *
+ * libghostty-vt parses the protocol and tracks every image and placement, so
+ * a pane's images exist as data; what a multiplexer has to add is *re-emitting*
+ * them to the client's terminal at the right place, with ids that cannot
+ * collide between panes.
+ *
+ * This is why pi has to fall back to sixel under tmux and zellij: they drop
+ * the images entirely. Here the native path works.
+ */
+#ifndef SLOSH_GRAPHICS_H
+#define SLOSH_GRAPHICS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct graphics graphics_t;
+
+/* One image, as this session knows it. */
+typedef struct {
+  uint32_t pane;   /* which pane transmitted it */
+  uint32_t src_id; /* the id the program chose, unique only within its pane */
+  uint32_t out_id; /* the id we give the client, unique across the session */
+  uint64_t gen;    /* image generation, so a changed image is re-sent */
+  bool sent;
+} gfx_image_t;
+
+/* One placement on screen this frame -- or one visible piece of it, when
+ * something on top has cut it into more than one rectangle. */
+typedef struct {
+  uint32_t out_id;
+  uint32_t place_id; /* the id the program chose */
+  /* Which visible rectangle of that placement this is. A placement nothing
+   * covers has one piece; a float across the middle of an image leaves two,
+   * and a float in a corner leaves two or three -- each of them a placement
+   * of its own on the wire, which is the only shape the protocol has. */
+  uint16_t piece;
+  /* The placement id the client is told, ours to hand out: the pieces of one
+   * placement need an id each, and the program's own id is one number that
+   * cannot be several. */
+  uint32_t wire_id;
+  uint16_t col, row; /* screen cells */
+  uint16_t cols, rows;
+  /* Where the image starts *inside* its first cell, in pixels. This is what
+   * makes motion smooth instead of snapping a cell at a time, and dropping it
+   * is invisible in a still picture and obvious the moment anything moves. */
+  uint32_t x_off, y_off;
+  /* Cells to scale into, or 0 to draw at natural size. Only sent on when the
+   * program asked for it. */
+  uint16_t scale_cols, scale_rows;
+  uint32_t sx, sy, sw, sh; /* source rectangle, in image pixels */
+  bool live;
+  /* The client is holding this placement, exactly as described above. A
+   * placement the terminal already has is not re-sent: see gfx_flush(). */
+  bool shown;
+} gfx_place_t;
+
+graphics_t *gfx_new(void);
+void gfx_free(graphics_t *g);
+
+/* Start a frame: everything placed last frame is marked stale. */
+void gfx_begin(graphics_t *g);
+/* Everything gfx_place() needs: where it goes, what it crops to, and the
+ * image itself for the first time it is seen.
+ *
+ * A struct rather than the twenty positional arguments this used to be. Half
+ * of them are uint32_t pixel quantities, so a transposed pair compiles
+ * perfectly and shows up as a picture in slightly the wrong place — which is
+ * exactly the bug class this file is for. */
+typedef struct {
+  uint32_t pane;   /* which pane it belongs to */
+  uint32_t src_id; /* the id the program chose */
+  uint64_t gen;    /* image generation, so a changed image is re-sent */
+  uint32_t place_id;
+  uint16_t piece;                  /* which visible rectangle of it */
+  uint16_t col, row;               /* screen cells */
+  uint16_t cols, rows;             /* cells covered */
+  uint16_t scale_cols, scale_rows; /* cells to scale into, 0 for natural */
+  uint32_t x_off, y_off;           /* offset within the first cell, in pixels */
+  uint32_t sx, sy, sw, sh;         /* source rectangle, in image pixels */
+  uint32_t px_w, px_h;             /* the image's own size */
+  uint32_t cell_px_w, cell_px_h;   /* canonical pixels represented by a cell */
+  int format, compression;
+  const uint8_t *data; /* NULL once the client has it */
+  size_t data_len;
+} gfx_req_t;
+
+/* Record a visible placement, transmitting the image if the client has not
+ * seen it yet. `data` may be NULL when the image is already transmitted. */
+void gfx_place(graphics_t *g, const gfx_req_t *req);
+/* End a frame: emit transmits, placements and deletions. Borrowed until the
+ * next gfx_begin(). The frame is provisional until gfx_commit() says whether
+ * the bytes reached the client. */
+char *gfx_flush(graphics_t *g, size_t *out_len);
+/* The verdict on the last flushed frame. Delivered: the client is caught up.
+ * Not delivered: transmissions are forgotten so they are re-sent, and
+ * deletions stay owed -- a deletion the client never hears is an image
+ * parked on its screen that no scrolling will ever move. A flush nobody
+ * commits counts as undelivered at the next gfx_begin(). */
+void gfx_commit(graphics_t *g, bool delivered);
+
+/* Forget what the client has seen (it is a different client now, or its screen
+ * was cleared -- ESC[2J takes the images with it). Everything still on screen
+ * is transmitted and placed again on the next frame. */
+void gfx_reset(graphics_t *g);
+/* The client's screen was cleared (a full repaint takes the images with it):
+ * every placement is owed again, while transmitted pixels and owed deletions
+ * stand. */
+void gfx_repaint(graphics_t *g);
+/* Drop everything belonging to a pane that is gone. */
+void gfx_forget_pane(graphics_t *g, uint32_t pane);
+
+size_t gfx_placements(const graphics_t *g, const gfx_place_t **out);
+size_t gfx_images(const graphics_t *g, const gfx_image_t **out);
+
+#endif /* SLOSH_GRAPHICS_H */

@@ -1,0 +1,875 @@
+#!/usr/bin/env python3
+"""Splitting by clicking a border, with a guide that shows what will happen.
+
+The old per-pane `+` was one glyph for a verb that has four directions, and it
+taxed every frame three columns forever. A border encodes the direction by
+being on that side, costs nothing when idle, and shows a preview on hover.
+"""
+
+import os
+import sys
+import tempfile
+import time
+
+from harness import Session, check, report
+
+FAST_TEXT = "hover_delay_ms 20\n"
+
+
+def cfg(text):
+    f = tempfile.NamedTemporaryFile("w", suffix=".kdl", delete=False)
+    f.write(text)
+    f.close()
+    return f.name
+
+
+FAST = cfg(FAST_TEXT)
+
+SH = ["/bin/sh", "-c", 'printf "\\033]2;shell\\007"; stty raw -echo; cat']
+
+
+def hover(s, x, y):
+    s.send(rf"\e[<35;{x + 1};{y + 1}M")
+
+
+def rest(s, x, y):
+    """Hover and stay there: the guide arms on dwell, not on contact.
+
+    The wait is real elapsed time - the guide is gated on a clock, not on
+    anything observable - so the sessions that are not *about* the dwell run
+    with FAST_TEXT and pay 20ms instead of 250."""
+    hover(s, x, y)
+    time.sleep(0.06)
+
+
+def click(s, x, y):
+    s.send(rf"\e[<0;{x + 1};{y + 1}M")
+    s.send(rf"\e[<0;{x + 1};{y + 1}m")
+
+
+def test_no_more_plus():
+    """The frame carries no `+`, which is what lets the strip's new-tab button
+    *be* a bare `+`: there is exactly one of them in the UI, so it means one
+    thing. If a `+` ever returns to a frame, that button needs its word back.
+    """
+    with Session(SH, cols=60, rows=14, config=FAST) as s:
+        s.settle()
+        snap = s.snapshot()
+        p = s.pane()
+        check(
+            "the frame has no split button any more",
+            "+" not in snap.line(p["y"]),
+            repr(snap.line(p["y"])),
+        )
+        check(
+            "the status bar still has its own new-tab button",
+            any(h["action"] == "newtab" and h["y"] == 1 for h in snap.hits),
+            repr(snap.line(1)),
+        )
+        # The frame does spend columns again -- six of them, on the zoom and
+        # close buttons -- but on two verbs that a single glyph *can* encode.
+        # The split button was removed because one glyph cannot mean four
+        # directions, not because buttons are forbidden. With them off, the row
+        # is all title and rule again, and that is the stronger claim.
+        check(
+            "the title gets most of the row back",
+            snap.line(p["y"]).count("─") > p["w"] - 20,
+            repr(snap.line(p["y"])),
+        )
+
+    with Session(
+        SH, cols=60, rows=14, config=cfg(FAST_TEXT + "pane_buttons false\n")
+    ) as s:
+        s.settle()
+        snap, p = s.snapshot(), s.pane()
+        check(
+            "and all of it when the buttons are off",
+            snap.line(p["y"]).count("─") > p["w"] - 12,
+            repr(snap.line(p["y"])),
+        )
+
+
+def test_each_border_splits_toward_itself():
+    for side, expect in [("r", "right"), ("l", "left"), ("b", "below"), ("t", "above")]:
+        with Session(SH, cols=80, rows=26, config=FAST) as s:
+            s.settle()
+            before = s.pane()
+            # The handle in the middle of that edge, not just any cell on it:
+            # the rest of the edge deliberately does nothing.
+            x, y = s.snapshot().handle(before["id"], side)
+            click(s, x, y)
+            s.settle(80)
+            panes = s.panes()
+            check(
+                f"clicking the {side} border splits", len(panes) == 2, str(len(panes))
+            )
+            if len(panes) != 2:
+                continue
+
+            old = [q for q in panes if q["id"] == before["id"]][0]
+            new = [q for q in panes if q["id"] != before["id"]][0]
+            if expect == "right":
+                ok = new["x"] > old["x"] and new["y"] == old["y"]
+            elif expect == "left":
+                ok = new["x"] < old["x"] and new["y"] == old["y"]
+            elif expect == "below":
+                ok = new["y"] > old["y"] and new["x"] == old["x"]
+            else:
+                ok = new["y"] < old["y"] and new["x"] == old["x"]
+            check(
+                f"the new pane lands {expect}",
+                ok,
+                f"old={old['x']},{old['y']} new={new['x']},{new['y']}",
+            )
+            check("and takes focus", new["focused"], str(new))
+            said = {
+                "r": "split right",
+                "l": "split left",
+                "b": "split down",
+                "t": "split up",
+            }[side]
+            check(
+                "and it says which way it went",
+                said in s.snapshot().screen(),
+                repr(s.snapshot().screen()[-80:]),
+            )
+
+
+def test_the_guide_escalates_from_edge_to_handle():
+    """Two stages: the edge says *where the button is*, the handle says *what
+    the click will do*. Hovering anywhere on an edge must show the first without
+    the second, or brushing a border would still draw a boundary nobody asked
+    about."""
+    with Session(SH, cols=80, rows=26, config=FAST) as s:
+        s.settle()
+        p = s.pane()
+        snap = s.snapshot()
+        check(
+            "no guide when the pointer is elsewhere",
+            "┃" not in snap.screen() and "╎" not in snap.screen(),
+            repr(snap.screen()[:120]),
+        )
+
+        rx, ry = snap.rim(p["id"], "l")
+        rest(s, rx, ry)
+        snap = s.snapshot()
+        check(
+            "hovering the rim of a side border arms it",
+            "┃" in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+        check(
+            "and shows the handle you are meant to click",
+            "█" in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+        check(
+            "but previews no boundary yet",
+            "╎" not in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+
+        hx, hy = snap.handle(p["id"], "l")
+        rest(s, hx, hy)
+        snap = s.snapshot()
+        check(
+            "on the handle it previews where the split would land",
+            "╎" in snap.screen() and "█" in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+
+        bx, by = snap.handle(p["id"], "b")
+        rest(s, bx, by)
+        snap = s.snapshot()
+        check(
+            "hovering the bottom handle arms that instead",
+            "━" in snap.screen() and "╌" in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+        check(
+            "and the side guide is gone",
+            "┃" not in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+
+        rest(s, p["content_x"] + 3, p["content_y"] + 2)  # into the content
+        snap = s.snapshot()
+        check(
+            "moving off a border puts the guide away",
+            "━" not in snap.screen()
+            and "┃" not in snap.screen()
+            and "█" not in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+
+
+def test_the_handle_thickens_by_a_column_never_a_row():
+    """A cell is about twice as tall as it is wide, so the two axes cannot both
+    grow by one and look the same. An upright handle takes a second column; a
+    horizontal one stays on its own row and gets heavier instead, because two
+    rows of block across a border reads as a wall and costs a row of output."""
+    with Session(SH, cols=80, rows=26, config=FAST) as s:
+        s.settle()
+        p = s.pane()
+
+        def blocks(snap):
+            return [
+                (x, y)
+                for y, row in enumerate(snap.text)
+                for x, ch in enumerate(row)
+                if ch == "█"
+            ]
+
+        for side in ("t", "b"):
+            hx, hy = s.snapshot().handle(p["id"], side)
+            rest(s, hx, hy)
+            cells = blocks(s.snapshot())
+            rows = {y for _, y in cells}
+            check(
+                f"the {side} handle is one row tall",
+                cells and rows == {hy},
+                f"rows {sorted(rows)}, handle row {hy}",
+            )
+
+        for side in ("l", "r"):
+            hx, hy = s.snapshot().handle(p["id"], side)
+            rest(s, hx, hy)
+            cells = blocks(s.snapshot())
+            cols = {x for x, _ in cells}
+            inward = hx + 1 if side == "l" else hx - 1
+            check(
+                f"the {side} handle is two columns wide",
+                cells and cols == {hx, inward},
+                f"columns {sorted(cols)}, wanted {sorted((hx, inward))}",
+            )
+            check(
+                f"and the {side} handle's inner column is clickable",
+                s.snapshot().hit_at(inward, hy) == f"border:{p['id']}:{side}",
+                str(s.snapshot().hit_at(inward, hy)),
+            )
+
+
+def test_guide_follows_the_new_layout():
+    """Regression: the guide described the layout from *before* the split.
+
+    Hover state used to be remembered from the last motion event, so after a
+    click split the guide stayed attached to the old pane and the old edge
+    until the mouse moved and corrected it. It is derived during the paint
+    now, from the rects that paint registered.
+    """
+    with Session(SH, cols=120, rows=26, config=FAST) as s:
+        s.settle()
+        p = s.pane()
+        edge_x, edge_y = s.snapshot().handle(p["id"], "r")
+
+        rest(s, edge_x, edge_y)
+        click(s, edge_x, edge_y)
+        s.settle(100)  # and deliberately no further mouse movement
+
+        snap = s.snapshot()
+        panes = s.panes()
+        check("the split happened", len(panes) == 2, str(len(panes)))
+
+        armed = [
+            q
+            for q in panes
+            if "┃" in "".join(row[q["x"] : q["x"] + q["w"]] for row in snap.text)
+        ]
+        check("exactly one pane shows a guide", len(armed) == 1, str(armed))
+        if len(armed) != 1:
+            return
+        check(
+            "and it is the one the pointer is actually over",
+            armed[0]["x"] <= edge_x < armed[0]["x"] + armed[0]["w"],
+            f"pointer at {edge_x}, guide on {armed[0]['x']}..{armed[0]['x'] + armed[0]['w']}",
+        )
+        check(
+            "on the edge the pointer is on",
+            (snap.hit_at(edge_x, edge_y) or "").endswith(f"{armed[0]['id']}:r"),
+            str(snap.hit_at(edge_x, edge_y)),
+        )
+
+
+def test_the_guide_waits_for_a_rest():
+    """A pointer crossing a border on its way elsewhere must not flash it."""
+    with Session(SH, cols=80, rows=26, config=FAST) as s:
+        s.settle()
+        p = s.pane()
+        left, right = p["x"], p["x"] + p["w"] - 1
+        row = p["y"] + 3
+
+        hover(s, left, row)
+        snap = s.snapshot()  # no dwell: this is the moment of contact
+        check(
+            "touching a border does not arm it immediately",
+            "┃" not in snap.screen(),
+            repr(snap.screen()[:160]),
+        )
+
+        # keep moving: across the pane and onto the other border
+        hover(s, left + 6, row)
+        hover(s, right, row)
+        snap = s.snapshot()
+        check(
+            "passing over borders arms nothing",
+            "┃" not in snap.screen(),
+            repr(snap.screen()[:160]),
+        )
+
+        time.sleep(0.4)  # now rest
+        snap = s.snapshot()
+        check("resting on one arms it", "┃" in snap.screen(), repr(snap.screen()[:200]))
+        check(
+            "and it is the border being rested on",
+            snap.hit_at(right, row)
+            in (
+                f"border:{p['id']}:r",
+                f"brim:{p['id']}:r",
+            ),
+            str(snap.hit_at(right, row)),
+        )
+
+        hover(s, p["content_x"] + 2, row)
+        snap = s.snapshot()
+        check(
+            "moving away disarms it at once",
+            "┃" not in snap.screen(),
+            repr(snap.screen()[:160]),
+        )
+
+
+def test_press_skips_the_wait():
+    with Session(SH, cols=80, rows=26) as s:
+        s.settle()
+        p = s.pane()
+        x, y = edge_of(s, p, "r")  # the handle: the rim answers no press
+        s.send(rf"\e[<0;{x + 1};{y + 1}M")  # press and hold: that is intent
+        snap = s.snapshot()
+        check(
+            "holding the button on a border arms it immediately",
+            "┃" in snap.screen(),
+            repr(snap.screen()[:200]),
+        )
+        s.send(rf"\e[<0;{x + 1};{y + 1}m")
+
+
+def test_delay_is_configurable():
+    import os
+    import tempfile
+
+    f = tempfile.NamedTemporaryFile("w", suffix=".kdl", delete=False)
+    f.write("hover_delay_ms 0\n")
+    f.close()
+    with Session(SH, cols=80, rows=26, config=f.name) as s:
+        s.settle()
+        p = s.pane()
+        hover(s, p["x"], p["y"] + 3)
+        snap = s.snapshot()
+        check(
+            "with no delay configured it arms on contact",
+            "┃" in snap.screen(),
+            repr(snap.screen()[:160]),
+        )
+    os.unlink(f.name)
+
+
+def test_guide_is_per_pane():
+    with Session(SH, cols=150, rows=26, config=FAST) as s:
+        s.settle()
+        s.key("\\\\")
+        s.settle()
+        left, right = s.panes()
+        rest(s, left["x"], left["y"] + 2)
+        snap = s.snapshot()
+        row = snap.line(left["y"] + 2)
+        check(
+            "the hovered pane is armed",
+            "┃" in row[left["x"] : left["x"] + left["w"]],
+            repr(row),
+        )
+        check(
+            "the other one is not",
+            "┃" not in row[right["x"] : right["x"] + right["w"]],
+            repr(row),
+        )
+
+
+def test_drag_still_moves():
+    """The top border does double duty: click splits, drag moves."""
+    with Session(SH, cols=90, rows=26, config=FAST) as s:
+        s.settle()
+        s.key("\\\\")
+        s.settle()
+        left, right = s.panes()
+
+        # drag: press, move, release -> swap, not split
+        s.send(rf"\e[<0;{left['x'] + 5};{left['y'] + 1}M")
+        s.send(rf"\e[<32;{right['x'] + 5};{right['y'] + 3}M")
+        s.send(rf"\e[<0;{right['x'] + 5};{right['y'] + 3}m")
+        s.settle(80)
+        check(
+            "dragging the top border still moves the pane",
+            len(s.panes()) == 2,
+            str(len(s.panes())),
+        )
+        panes = {q["id"]: q for q in s.panes()}
+        check(
+            "and swaps them",
+            panes[left["id"]]["x"] > panes[right["id"]]["x"],
+            str(s.panes()),
+        )
+
+        # click: press, release, no motion, on the handle -> split up. The rest
+        # of the row is a drag handle only, which is the point of the handle.
+        hx, hy = edge_of(s, s.panes()[0], "t")
+        s.send(rf"\e[<0;{hx + 1};{hy + 1}M")
+        s.send(rf"\e[<0;{hx + 1};{hy + 1}m")
+        s.settle(80)
+        check(
+            "clicking its handle splits instead",
+            len(s.panes()) == 3,
+            str(len(s.panes())),
+        )
+        # and the rest of the row does not: the accident this whole shape exists
+        # to stop. Counted from the pane the handle click just created.
+        n = len(s.panes())
+        top = s.panes()[0]
+        rx, ry = s.snapshot().rim(top["id"], "t")
+        s.send(rf"\e[<0;{rx + 1};{ry + 1}M")
+        s.send(rf"\e[<0;{rx + 1};{ry + 1}m")
+        s.settle(80)
+        check(
+            "while the rest of the row splits nothing",
+            len(s.panes()) == n,
+            f"{n} -> {len(s.panes())}",
+        )
+
+
+def test_tiny_panes_have_no_targets():
+    with Session(SH, cols=90, rows=16, config=FAST) as s:
+        s.settle()
+        s.key("\\\\")
+        s.settle()
+        s.resize(30, 8)  # collapses to a stack
+        s.settle(80)
+        snap = s.snapshot()
+        check(
+            "a collapsed layout still draws and does not crash",
+            s.api("alive")["alive"],
+            "",
+        )
+        # Say what this means rather than pattern-matching on shape: a *header*
+        # offers no split targets. The old form forbade any 1x1-ish border hit,
+        # which also catches the legitimate side border of a very short pane
+        # that is merely small, not collapsed.
+        header_rows = {p["y"] for p in s.panes() if p["hidden"]}
+        on_headers = [
+            h
+            for h in snap.hits
+            if h["action"].startswith("border:") and h["y"] in header_rows
+        ]
+        check(
+            "a collapsed header is a focus target, not a split one",
+            not on_headers,
+            str(on_headers),
+        )
+
+
+# ---- the floor: a split that is not worth making is not offered ------------
+
+ARROWS = {"l": "\u25c4", "r": "\u25ba", "t": "\u25b2", "b": "\u25bc"}
+
+
+def edge_of(s, pane, side):
+    """The cell on that side that actually does something: its handle.
+
+    Read out of the hit list rather than worked out here, so these tests cannot
+    quietly agree with a geometry bug. The rest of an edge is the rim, which is
+    what `Snapshot.rim` is for.
+    """
+    return s.snapshot().handle(pane["id"], side)
+
+
+def test_a_split_below_the_floor_is_not_offered():
+    """min_split is a usability floor, not the physical one: the pane below
+    would still *fit* by min_pane, and is refused anyway."""
+    conf = cfg(FAST_TEXT + "min_pane cols=10 rows=3\nmin_split cols=40 rows=14\n")
+    with Session(SH, cols=80, rows=26, config=conf) as s:
+        s.settle()
+        p = s.pane()
+        for side in ("l", "r", "t", "b"):
+            x, y = edge_of(s, p, side)
+            rest(s, x, y)
+            snap = s.snapshot()
+            body = snap.screen()
+            check(
+                f"resting on the {side} border arms nothing below the floor",
+                "\u2503" not in body and "\u2501" not in body,
+                repr(body[:80]),
+            )
+            click(s, x, y)
+            s.settle(80)
+            check(
+                f"and clicking the {side} border splits nothing",
+                len(s.panes()) == 1,
+                str(len(s.panes())),
+            )
+    os.unlink(conf)
+
+
+def test_the_floor_is_configurable_in_both_axes():
+    # Wide enough for columns, too short for rows.
+    conf = cfg(FAST_TEXT + "min_split cols=20 rows=40\n")
+    with Session(SH, cols=90, rows=26, config=conf) as s:
+        s.settle()
+        p = s.pane()
+        x, y = edge_of(s, p, "b")
+        click(s, x, y)
+        s.settle(80)
+        check(
+            "a row split below the row floor is refused",
+            len(s.panes()) == 1,
+            str(len(s.panes())),
+        )
+        x, y = edge_of(s, p, "r")
+        click(s, x, y)
+        s.settle(80)
+        check(
+            "while a column split above the column floor still happens",
+            len(s.panes()) == 2,
+            str(len(s.panes())),
+        )
+    os.unlink(conf)
+
+
+def test_the_keyboard_obeys_the_same_floor():
+    conf = cfg(FAST_TEXT + "min_split cols=40 rows=14\n")
+    with Session(SH, cols=80, rows=26, config=conf) as s:
+        s.settle()
+        s.key("\\\\")
+        s.settle(80)
+        check(
+            "the keyboard will not split below the floor either",
+            len(s.panes()) == 1,
+            str(len(s.panes())),
+        )
+        # ...but a script asking for a pane is declaring, not being offered.
+        s.api("split", dir="cols")
+        s.settle(80)
+        check(
+            "the control API is not bound by it",
+            len(s.panes()) == 2,
+            str(len(s.panes())),
+        )
+    os.unlink(conf)
+
+
+def test_the_guide_says_which_way_it_goes():
+    with Session(SH, cols=120, rows=26, config=FAST) as s:
+        s.settle()
+        p = s.pane()
+        for side in ("l", "r", "t", "b"):
+            x, y = edge_of(s, p, side)
+            rest(s, x, y)
+            body = s.snapshot().screen()
+            check(
+                f"the {side} guide carries its own arrow",
+                ARROWS[side] in body,
+                repr(ARROWS[side]),
+            )
+            others = [a for k, a in ARROWS.items() if k != side]
+            check(
+                f"and only that one",
+                not any(o in body for o in others),
+                repr(body[:80]),
+            )
+
+
+def test_the_arrow_rides_the_handle():
+    """The arrow used to sit halfway along the dashed line, which split the
+    message in two: the handle said *press here* and something out in the middle
+    of the pane said *this is what happens*. It belongs on the button."""
+    with Session(SH, cols=120, rows=26, config=FAST) as s:
+        s.settle()
+        p = s.pane()
+        for side in ("l", "r", "t", "b"):
+            hx, hy = edge_of(s, p, side)
+            rest(s, hx, hy)
+            snap = s.snapshot()
+            pos = snap.find(ARROWS[side])
+            # Inside the handle: same row for an upright edge, same column for a
+            # horizontal one, and never out on the boundary line.
+            near = pos is not None and (
+                (side in "lr" and pos[1] == hy and abs(pos[0] - hx) <= 1)
+                or (side in "tb" and pos[1] == hy and abs(pos[0] - hx) <= 3)
+            )
+            check(
+                f"the {side} arrow is on the handle",
+                near,
+                f"{pos} vs handle ({hx},{hy})",
+            )
+            check(
+                f"and the {side} boundary line carries none",
+                pos != (p["x"] + p["w"] // 2, p["y"] + p["h"] // 2),
+                str(pos),
+            )
+
+        # The arrow is part of the button, so it is legible from the first stage:
+        # brushing an edge says which way that handle splits, without previewing
+        # a boundary.
+        rx, ry = s.snapshot().rim(p["id"], "l")
+        rest(s, rx, ry)
+        snap = s.snapshot()
+        check(
+            "and it shows on rim hover too, with no boundary",
+            ARROWS["l"] in snap.screen() and "╎" not in snap.screen(),
+            repr([l for l in snap.text if ARROWS["l"] in l][:1]),
+        )
+
+
+def test_the_top_handle_aims_at_the_middle_and_keeps_the_row_readable():
+    """Two faults that fed each other.
+
+    The handle went to the *widest* free run of the top row, and a centred title
+    leaves two runs of nearly the same width — so a one-cell difference nobody
+    can see threw it out toward a corner. And the armed edge ruled straight
+    through the title, so the thing it sits beside was invisible, which is what
+    made the position look arbitrary rather than merely off.
+    """
+    plain = ["/bin/sh", "-c", "stty raw -echo; cat"]
+    with Session(plain, cols=110, rows=28, config=FAST) as s:
+        s.settle()
+        p = s.pane()
+        e = [h for h in s.snapshot().hits if h["action"] == f"title:{p['id']}:t"][0]
+        mid = p["x"] + p["w"] // 2
+        centre = e["x"] + e["w"] // 2
+        check(
+            "with nothing in the way the handle is centred on the row",
+            abs(centre - mid) <= 1,
+            f"handle centre {centre}, row middle {mid}",
+        )
+
+    with Session(SH, cols=110, rows=28, config=FAST) as s:  # SH sets a title
+        s.settle()
+        p = s.pane()
+        snap = s.snapshot()
+        e = [h for h in snap.hits if h["action"] == f"title:{p['id']}:t"][0]
+        name = [h for h in snap.hits if h["action"] == f"panetitle:{p['id']}"][0]
+        check(
+            "and when the title holds the middle it sits against it",
+            e["x"] == name["x"] + name["w"] or e["x"] + e["w"] == name["x"],
+            f"handle {e['x']}..{e['x'] + e['w'] - 1}, "
+            f"title {name['x']}..{name['x'] + name['w'] - 1}",
+        )
+
+        # ...which only reads as deliberate if the armed edge leaves the title be.
+        hx, hy = snap.handle(p["id"], "t")
+        rest(s, hx, hy)
+        row = s.snapshot().text[p["y"]]
+        check(
+            "the armed top edge does not rule through the name",
+            "shell" in row,
+            repr(row),
+        )
+        check(
+            "nor through the buttons",
+            all(m in row for m in ("▬", "□", "✕")),
+            repr(row),
+        )
+
+
+# ---- `C-a Enter`: split whichever way there is room for -----------------------
+
+
+def geometry(s):
+    return [
+        (p["x"], p["y"], p["w"], p["h"])
+        for p in sorted(s.panes(), key=lambda q: (q["y"], q["x"]))
+    ]
+
+
+def toast_line(s):
+    got = [
+        l.strip()
+        for l in s.snapshot().text
+        if "split right" in l or "split down" in l or "no room" in l
+    ]
+    return got[-1] if got else ""
+
+
+def test_it_splits_across_the_longer_side():
+    """Longer as you *see* it: a cell is about twice as tall as it is wide, so a
+    100x24 terminal is a wide pane and wants cutting into columns, while 60x40 is a
+    tall one and wants rows. `gap_aspect` is the number that says so."""
+    with Session(SH, cols=100, rows=24) as s:
+        s.settle()
+        s.key(r"\r")
+        s.settle(60)
+        g = geometry(s)
+        check(
+            "a wide pane splits into columns",
+            len(g) == 2 and g[0][1] == g[1][1],
+            str(g),
+        )
+        check("side by side, evenly", g[0][2] == g[1][2], str(g))
+        check(
+            "and it says which way it went",
+            toast_line(s) == "split right",
+            repr(toast_line(s)),
+        )
+
+    with Session(SH, cols=60, rows=40) as s:
+        s.settle()
+        s.key(r"\r")
+        s.settle(60)
+        g = geometry(s)
+        check(
+            "a tall pane splits into rows", len(g) == 2 and g[0][0] == g[1][0], str(g)
+        )
+        check("one above the other", g[1][1] > g[0][1], str(g))
+        check("and says so", toast_line(s) == "split down", repr(toast_line(s)))
+
+
+def test_the_aspect_is_the_configured_one():
+    """`gap_aspect` is already this program's answer to how many columns a row is
+    worth, so it is the number that decides "longer" -- one knob, one answer, rather
+    than a second constant meaning the same thing.
+
+    74x44 is the case that proves it: the pane is about 72x40, which is wider than it
+    is tall in *cells* and taller than it is wide once a row counts double. Square
+    cells split it into columns; the default splits it into rows.
+    """
+    square = cfg("gap_aspect 1\n")
+    with Session(SH, cols=74, rows=44, config=square) as s:
+        s.settle()
+        s.key(r"\r")
+        s.settle(60)
+        g = geometry(s)
+        check(
+            "with square cells, 72x40 splits into columns",
+            len(g) == 2 and g[0][1] == g[1][1],
+            str(g),
+        )
+    with Session(SH, cols=74, rows=44) as s:
+        s.settle()
+        s.key(r"\r")
+        s.settle(60)
+        g = geometry(s)
+        check(
+            "...and with the default aspect, the same pane splits into rows",
+            len(g) == 2 and g[0][0] == g[1][0],
+            str(g),
+        )
+    os.unlink(square)
+
+
+def test_it_falls_back_to_the_axis_that_fits():
+    """The point of the action: on a pane that is wide but short the longer side is
+    across, and if that does not fit the other one is tried before giving up."""
+    # 150x14: the pane is 146x10 -- wide, so columns are preferred, and two columns
+    # of 73 clear `min_split cols=32`. Rows would not (10 rows cannot make two of 8).
+    with Session(SH, cols=150, rows=14) as s:
+        s.settle()
+        s.key(r"\r")
+        s.settle(60)
+        g = geometry(s)
+        check("wide and short splits into columns", g[0][1] == g[1][1], str(g))
+
+    # 40x50: the pane is 36x46 -- tall, so rows, and 46 makes two of 8 easily while
+    # 36 columns cannot make two of 32.
+    with Session(SH, cols=40, rows=50) as s:
+        s.settle()
+        s.key(r"\r")
+        s.settle(60)
+        g = geometry(s)
+        check("narrow and tall splits into rows", g[0][0] == g[1][0], str(g))
+        check(
+            "...even though columns is what a naive cell count would pick",
+            g[1][1] > g[0][1],
+            str(g),
+        )
+
+
+def test_no_room_says_so_rather_than_collapsing_the_tab():
+    """A pane already under the floor cannot be split into two panes worth having by
+    either axis -- and `split_fits` used to say yes, because it only asked about the
+    dimension it was dividing. The answer was two panes the layout immediately
+    collapsed into a list, from an action that was offered."""
+    with Session(SH, cols=100, rows=8) as s:
+        s.settle()
+        before = geometry(s)
+        s.key(r"\r")
+        s.settle(60)
+        check(
+            "nothing was split",
+            geometry(s) == before,
+            "%s -> %s" % (before, geometry(s)),
+        )
+        check(
+            "and it says why", toast_line(s) == "no room to split", repr(toast_line(s))
+        )
+
+    # The explicit keys answer the same way, because whether there is room cannot
+    # depend on which key you asked with.
+    with Session(SH, cols=100, rows=8) as s:
+        s.settle()
+        before = geometry(s)
+        s.key("\\\\")
+        s.settle(60)
+        check("`C-a \\` refuses it too", geometry(s) == before, str(geometry(s)))
+        check(
+            "...in its own words",
+            "no room to split across" in s.snapshot().screen(),
+            repr(s.snapshot().screen()[-100:]),
+        )
+
+
+def test_it_is_on_the_sheet_and_in_the_palette():
+    with Session(SH, cols=100, rows=30) as s:
+        s.settle()
+        s.send(r"\x01?")
+        s.settle(60)
+        sheet = s.snapshot().screen()
+        check(
+            "the sheet lists it",
+            "split the longer way" in sheet,
+            repr([l.strip() for l in s.snapshot().text if "longer" in l]),
+        )
+        check("under Enter", "enter" in sheet.lower(), "")
+        s.send(r"\e")
+        s.settle(40)
+        s.send(r"\x01p")
+        s.settle(40)
+        s.send("longer")
+        s.settle(60)
+        check(
+            "and the palette finds it",
+            "split the longer way" in s.snapshot().screen(),
+            repr([l.strip() for l in s.snapshot().text if "longer" in l]),
+        )
+
+
+if __name__ == "__main__":
+    test_no_more_plus()
+    test_each_border_splits_toward_itself()
+    test_the_guide_escalates_from_edge_to_handle()
+    test_the_handle_thickens_by_a_column_never_a_row()
+    test_guide_follows_the_new_layout()
+    test_the_guide_waits_for_a_rest()
+    test_press_skips_the_wait()
+    test_delay_is_configurable()
+    test_guide_is_per_pane()
+    test_drag_still_moves()
+    test_tiny_panes_have_no_targets()
+    test_a_split_below_the_floor_is_not_offered()
+    test_the_floor_is_configurable_in_both_axes()
+    test_the_keyboard_obeys_the_same_floor()
+    test_the_guide_says_which_way_it_goes()
+    test_the_arrow_rides_the_handle()
+    test_the_top_handle_aims_at_the_middle_and_keeps_the_row_readable()
+    test_it_splits_across_the_longer_side()
+    test_the_aspect_is_the_configured_one()
+    test_it_falls_back_to_the_axis_that_fits()
+    test_no_room_says_so_rather_than_collapsing_the_tab()
+    test_it_is_on_the_sheet_and_in_the_palette()
+    sys.exit(report())

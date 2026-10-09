@@ -1,0 +1,804 @@
+/* The opinionated defaults, and the file that overrides them.
+ *
+ * Everything here has a working value compiled in, so a missing or broken
+ * config file costs you a warning, never a terminal (the fail-open property
+ * D9 asks of the CLI, applied to the mux itself).
+ */
+#ifndef SLOSH_CONFIG_H
+#define SLOSH_CONFIG_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#include "expr.h"
+#include "shader.h"
+#include "slosh.h"
+
+/* Pane states a shader can be hung off, in the order they are tested. Only
+ * states a pane can actually be seen in — which `dead` now is: a pane whose
+ * program exits is kept until it is dismissed, so there is a frame to draw.
+ * It ranks just under the drag states, above every ambient one: nothing about
+ * a pane is more worth knowing than that it is over. */
+typedef enum {
+  PSTATE_DRAGGING,    /* the pane you have hold of */
+  PSTATE_DROP_HOVER,  /* the one under the pointer, where it would land */
+  PSTATE_DROP_TARGET, /* the others, all of them somewhere it could go */
+  PSTATE_DEAD,        /* its program exited; waiting to be re-run or closed */
+  PSTATE_SUSPENDED,   /* laid out, never started */
+  /* A BEL arrived and nobody has looked since. Above the ambient states
+   * because it is *news* — the whole point of a bell is to be noticed on a
+   * pane you were not watching — and below `dead`, because a pane that rang
+   * and then exited is a pane that exited. It ends when you look at the pane,
+   * which is what answering a bell is. */
+  PSTATE_BELL,
+  PSTATE_SCROLLED, /* looking at scrollback rather than the present */
+  /* Lifted out of the layout, drawn on top. Above `unfocused`, so a float is
+   * never dimmed by dim_unfocused: full strength is what keeps the thing on
+   * top reading as lifted off the page — the same reason `dragging` keeps no
+   * default. Ships no chain of its own either; the shadow does the telling
+   * apart, and a config that wants colour writes `states { floating { } }`. */
+  PSTATE_FLOATING,
+  PSTATE_UNFOCUSED,
+  PSTATE_COUNT,
+} pane_state_t;
+
+/* The config name for a state, e.g. "drop_target". */
+const char *pane_state_name(pane_state_t s);
+
+typedef enum {
+  ACT_NONE = 0,
+  ACT_SPLIT,
+  ACT_SPLIT_COLS,
+  ACT_SPLIT_ROWS,
+  ACT_CLOSE_PANE,
+  ACT_RERUN,
+  ACT_ZOOM,
+  ACT_MINIMIZE,
+  ACT_FLOAT,
+  ACT_NEW_FLOAT,
+  ACT_FLOAT_GROW,
+  ACT_FLOAT_SHRINK,
+  ACT_SET_PURPOSE,
+  ACT_RENAME_PANE,
+  ACT_RENAME_TAB,
+  ACT_ROTATE_LAYOUT,
+  ACT_FOCUS_LEFT,
+  ACT_FOCUS_RIGHT,
+  ACT_FOCUS_UP,
+  ACT_FOCUS_DOWN,
+  ACT_FOCUS_NEXT,
+  ACT_NEW_TAB,
+  ACT_CLOSE_TAB,
+  ACT_NEXT_TAB,
+  ACT_PREV_TAB,
+  ACT_FINDER,
+  ACT_PALETTE,
+  ACT_WORKSPACES,
+  ACT_SAVE_WORKSPACE,
+  ACT_SCROLL_UP,
+  ACT_SCROLL_DOWN,
+  ACT_SCROLL_PAGE_UP,
+  ACT_SCROLL_PAGE_DOWN,
+  ACT_SCROLL_TOP,
+  ACT_SCROLL_BOTTOM,
+  ACT_SEARCH,
+  ACT_RESIZE_LEFT,
+  ACT_RESIZE_RIGHT,
+  ACT_RESIZE_UP,
+  ACT_RESIZE_DOWN,
+  ACT_EQUALIZE,
+  ACT_CLEAR_SHADERS,
+  ACT_PANE_TO_NEXT_TAB,
+  ACT_PANE_TO_PREV_TAB,
+  ACT_PANE_TO_NEW_TAB,
+  ACT_DETACH,
+  ACT_QUIT,
+  ACT_HELP,
+  ACT_EDIT_CONFIG,
+  ACT_THEMES,
+  ACT_LITERAL_PREFIX,
+  ACT_SELECT_TAB_1, /* .. +8, so digits stay one entry each */
+} action_t;
+
+typedef struct {
+  int key;       /* GhosttyKey */
+  uint16_t mods; /* MOD_* */
+  action_t action;
+  /* Fires without the leader, taking that chord away from every program in
+   * every pane. Deliberately possible and deliberately opt-in: it is the
+   * user's terminal and their keyboard, and a multiplexer that refuses to get
+   * out of the way is its own kind of wrong. */
+  bool direct;
+} binding_t;
+
+typedef enum { ALIGN_LEFT, ALIGN_CENTER, ALIGN_RIGHT } align_t;
+
+/* tab_bar_side: where the strip of tabs lives. Top is the classic row; left
+ * and right turn it into a sidebar, one tab per row. */
+enum {
+  TAB_BAR_TOP = 0,
+  TAB_BAR_LEFT,
+  TAB_BAR_RIGHT,
+};
+
+/* tab_bar_index: where a tab's number sits. `prefix` is `1:api`, the number
+ * against the name; `right` puts it at the far end of the row, which only a
+ * sidebar has -- the top strip's tabs are as wide as their labels, so there
+ * is no "far end" to put anything at. */
+enum {
+  TAB_INDEX_PREFIX = 0,
+  TAB_INDEX_RIGHT,
+};
+
+/* size_follows: which attached client sizes the shared screen. */
+enum {
+  SIZE_FOLLOWS_ACTIVE = 0, /* newest attach, then last input */
+  SIZE_FOLLOWS_SMALLEST,   /* min over clients: filler, never a crop */
+  SIZE_FOLLOWS_LARGEST,    /* max over clients: crops, never filler */
+};
+
+/* How many files one config may be built from: itself plus its includes. Small
+ * and fixed, because a config assembled from more than this many pieces is a
+ * thing nobody can read. */
+#define CONFIG_FILES_MAX 16
+
+/* How many project roots one config may name. `~/dev` and `~/work` is the case;
+ * a person with more than this many places they keep code has a search problem
+ * rather than a list problem. */
+#define PROJECT_ROOTS_MAX 8
+
+/* How many complaints one load keeps. A config with more than this many
+ * problems in it has one problem, and the list is long enough to say so. */
+#define CONFIG_MSGS_MAX 32
+
+/* Room for the colour table in config.c, checked against it there: the flags
+ * beside it live in the config, so the header needs a ceiling rather than the
+ * table. Generous, because overshooting costs one byte per unused slot. */
+#define THEME_COLORS_MAX 128
+
+/* How many named themes a picker will list, and how long a name may be. A
+ * theme is a file in a directory; both numbers are "more than anyone has". */
+#define THEMES_MAX 64
+#define THEME_NAME_MAX 64
+
+/* How many directories a theme is looked for in: yours, two derived from
+ * where the binary is, and the prefix this build was compiled with. */
+#define THEME_DIRS_MAX 4
+
+typedef struct {
+  /* geometry */
+  uint16_t gap, gap_aspect;
+  /* Space between a pane's frame and its contents, per side, in the same unit
+   * `gap` uses: ROWS. A horizontal one is multiplied by `gap_aspect` on the way
+   * out, so `padding 1` is a square-looking ring rather than a squashed one —
+   * and so a number means the same thing wherever it appears, however many of
+   * them were written. Written as 1, 2 or 4 values, CSS order. */
+  uint16_t pad_top, pad_right, pad_bottom, pad_left;
+  /* Shared borders instead of gaps: panes pack flush against 1-cell divider
+   * lines, one outer frame rings the tab, and each pane's title rides the
+   * line above it. `gap` stops applying — the boundary *is* the divider —
+   * while `padding` still works and `gap_aspect` keeps its other jobs
+   * (square-looking padding, the float nudge step). The dividers carry the
+   * same resize drag the gaps did; interior edges give up their
+   * click-to-split — a one-cell line cannot be both verbs — and the outer
+   * frame keeps it. */
+  bool compact;
+  bool rounded;
+  align_t title_align;
+  /* Cells between a frame's corner and the start of its title. The title
+   * always carries a space on each side on top of this, so a title can never
+   * end up welded to the rule beside it. */
+  uint16_t title_inset;
+  /* Mark a pane's titlebar when a BEL arrives there and nobody has looked
+   * since. Off makes a bell silent *and* invisible, which is a real choice. */
+  /* Buttons in the top-right of a pane's frame: zoom, and close. Off leaves
+   * the keyboard bindings alone; it is about the affordance, not the verb. */
+  /* A word in the middle of the status line for whatever the pointer is on.
+   * Discoverability for a frame whose affordances are mostly one character
+   * wide; off if you already know them. */
+  bool hints;
+  /* What slosh this is, in the middle of the status line, whenever there is
+   * no hint to put there. The slot is otherwise empty most of the time, and
+   * "which build am I attached to" is the first question when a session is
+   * behaving oddly -- a session keeps the binary it started with, so the
+   * answer is not whatever was built last. */
+  bool version_banner;
+  bool pane_buttons;
+  /* Marks of similar visual weight, so the even spacing between the buttons
+   * reads as even: a glyph that floats in a mostly-empty cell donates its own
+   * whitespace to the gap beside it and looks further away than its
+   * neighbours, which is what an en dash did here. */
+  /* 32 bytes because a mark is a grapheme cluster, not a character: a
+   family emoji is eighteen bytes on its own. Truncating one mid-
+   codepoint used to put invalid UTF-8 on the wire. */
+  char zoom_mark[32], zoom_on_mark[32], close_mark[32], min_mark[32];
+  /* The new-tab button at the end of the strip. Drawn with a space each side,
+   * so a one-character mark is still a three-cell target. */
+  char newtab_mark[32];
+  /* Whether that button is drawn at all. On by default -- it is the only
+   * pointer-reachable way to make a tab -- but the verb is also a chord and a
+   * palette entry, so anyone who works from the keyboard can have the row (or
+   * the columns) back and stop hitting it by accident. Setting newtab_mark to
+   * "" does the same thing by omission; this says it on purpose. */
+  bool newtab_button;
+  /* Air between the last tab and that button: blank *rows* in a sidebar,
+   * blank *columns* in the top strip -- the axis the list runs along, either
+   * way. The button sits at the end of a list of tabs whose rows all do
+   * something else, and a destructive-enough neighbour one cell away is a
+   * misclick waiting to happen; one cell of nothing is the cheapest fix.
+   * Dropped rather than the button itself when the strip is out of room. */
+  uint16_t newtab_pad;
+  bool bell_indicator;
+  /* What to draw. A short string rather than a fixed glyph: the obvious
+   * choice is an emoji bell, and emoji are drawn two columns wide by many
+   * terminals while chrome here is booked as one — so the default is narrow
+   * and anyone who knows their terminal can say otherwise. */
+  char bell_mark[32];
+  /* What a pane that says it is *busy* looks like in the sidebar: the frames
+   * of a spinner, separated by spaces. One frame is a static mark and costs
+   * nothing; several make it turn, and only then does the session keep a
+   * frame clock -- and only while such a row is actually on screen. Empty
+   * draws no mark at all and leaves the colour to say it. */
+  char busy_mark[64];
+  /* Milliseconds a spinner frame is held. Its own knob rather than anim_ms,
+   * which is how often the session repaints while something animates: this is
+   * how fast the thing being repainted moves, and a spinner stepping at the
+   * repaint rate is a blur. */
+  uint16_t busy_ms;
+  /* Which dead panes stay, showing what they printed and offering to run
+   * again, and which just go.
+   *
+   * The line is whether the pane was given a *command*. A pane told to run
+   * `npm run dev` is part of the session's shape and its death is news: you
+   * want the error, and you want the button that runs it again. A pane that
+   * is a shell -- one you split off to do something in -- is finished when
+   * you type `exit`, and leaving its corpse on screen to be dismissed is
+   * exactly the fussiness a terminal should not have.
+   *
+   * Not *who made it*: a shell is a shell whether it came from a layout file
+   * or from C-a \. That also means a session restored from dump-layout
+   * behaves like the one it was dumped from, since the dump writes `command=`
+   * only for panes that had one. */
+  enum { KEEP_DEAD_NONE, KEEP_DEAD_COMMANDS, KEEP_DEAD_ALL } keep_dead;
+  uint16_t min_pane_cols, min_pane_rows;
+  /* The smallest pane a split is allowed to *produce*. min_pane is the point
+   * below which the layout gives up and collapses a pane; this is the point
+   * below which splitting stopped being worth offering, which is a larger
+   * number and a different question. Never used below min_pane: refusing to
+   * offer something the layout would collapse anyway is the floor. */
+  uint16_t min_split_cols, min_split_rows;
+  uint16_t scroll_lines; /* rows per wheel notch */
+  /* How much history a pane keeps. `scrollback` is the number people mean --
+   * lines -- and `scrollback_bytes` is the ceiling that keeps one very wide,
+   * heavily styled pane from spending the machine to honour it: lib-vt applies
+   * whichever limit is reached first, and both depend on things a line count
+   * cannot see. 0 lines is no scrollback; 0 bytes is no ceiling.
+   *
+   * Not a `uint16_t`, because 65,535 is a number somebody will want to exceed
+   * and a silently wrapped limit is worse than a refused one. */
+  size_t scrollback;
+  size_t scrollback_bytes;
+  uint16_t toast_ms; /* how long an announcement stays up */
+  /* How long the logo splash stays over a freshly attached screen, 0 for
+   * never. Attach-only: a headless or scripted session has nobody to greet. */
+  uint16_t splash_ms;
+  uint16_t hover_delay_ms; /* how long the pointer must rest to arm a guide */
+  /* How often a selection drag held past a pane's top or bottom edge scrolls
+   * another step. The step size is how far past the edge the pointer is, so
+   * this is the metronome and the hand is the throttle. */
+  uint16_t select_scroll_ms;
+  uint16_t double_click_ms; /* how close two clicks must be to be a double */
+  /* What a double-click's word stops at, listed as *separators* rather than as
+   * word characters: anything unlisted belongs to a word, so text nobody
+   * enumerated -- CJK, accents, emoji -- needs no table. Whitespace always
+   * separates, listed or not. */
+  char word_separators[64];
+  /* How far everything behind a modal is pushed back, 0..255, 0 being off.
+   * A modal that floats over a screen as bright as it is reads as another
+   * pane rather than as something in front. */
+  uint8_t modal_scrim;
+  /* How far the panes you are *not* in are pushed back, 0..255 and 0 for not
+   * at all. A knob rather than only a `states { unfocused { } }` chain,
+   * because "dim the other panes" is a thing people want by name and should
+   * not have to know the shader vocabulary to ask for -- and because the
+   * argument against shipping it on was that turning it off should be
+   * obvious, which a single number is and a chain is not.
+   *
+   * Writing the state chain by hand still wins: the knob only fills it in
+   * when the config has not. */
+  uint8_t dim_unfocused;
+  /* How dark the cell of shade a floating pane casts on what it covers,
+   * 0..255 and 0 for no shadow. The shadow is what tells a float from a tile
+   * at a glance — the frame is the same frame — which is why it ships on and
+   * why it is a number rather than a state chain: turning it off should not
+   * require knowing the states block exists (the dim_unfocused argument). */
+  uint8_t float_shadow;
+
+  /* Colour passes every pane gets, in the order they were written. Ordinary
+   * shaders rather than policy: the session has no opinion about these, you
+   * asked for them. */
+  shader_t shaders[SHADE_MAX];
+  size_t nshaders;
+
+  /* What a pane looks like when it is in a particular state. A pane is
+   * usually in several at once — unfocused *and* scrolled, suspended *and*
+   * something you could drop onto — so exactly one wins, the first that
+   * matches in the order below. That order is fixed rather than taken from
+   * the config, because it is a ranking by urgency and not a preference: a
+   * pane you are holding should not be recoloured by anything, and a mode the
+   * whole screen is in outranks an ambient hint about one pane.
+   *
+   * Stacking them instead would let two reasons to be grey compound into one
+   * muddy grey that reads as neither, which is the mistake the drag policy
+   * already had to avoid by hand. */
+  shader_t state_shaders[PSTATE_COUNT][SHADE_MAX];
+  size_t state_n[PSTATE_COUNT];
+
+  /* Whether any file in this load named `scrolled` (or `bell`) itself. The
+   * default wash over scrollback and the default bell flash are derived from
+   * the theme *after* each file's theme block -- scroll_bg and bell
+   * respectively -- so a theme moves them with their indicators. But a chain
+   * somebody wrote, in this file or in one it included, must stand. A local
+   * flag cannot say that across an include chain, so they live here and are
+   * cleared with the rest of the defaults. */
+  bool scrolled_declared;
+  bool bell_declared;
+
+  /* The same two things again, over a pane's *frame* rather than its contents:
+   * any entry in `shaders` or in a state's block carrying `where="chrome"`
+   * lands here instead. Separate chains rather than a flag on each shader,
+   * because a pass is per rect: the contents and the frame are two rects and
+   * therefore two passes, and a chain is exactly the list one pass runs. It
+   * also keeps the flag out of the plugin ABI, which has no business knowing
+   * where a session chose to run an effect. */
+  shader_t chrome_shaders[SHADE_MAX];
+  size_t nchrome_shaders;
+  shader_t chrome_state_shaders[PSTATE_COUNT][SHADE_MAX];
+  size_t chrome_state_n[PSTATE_COUNT];
+  /* How often to repaint while something on screen is animated -- which means
+   * a shader whose amount reads the clock. Nothing else needs a frame clock:
+   * every other repaint has an event behind it. 0 turns animation off, in the
+   * sense that an animated shader then only advances when something else
+   * causes a frame. */
+  uint16_t anim_ms;
+  bool status_bar; /* the strip along the top: tabs, prefix, pane count */
+  /* Where the strip goes when it is on: the top row, or a sidebar on either
+   * edge. A sidebar lists one tab per row and moves the strip's indicators
+   * (pane count, prefix badge) to its bottom rows; the status line below is
+   * untouched and keeps the full width either way. */
+  int tab_bar_side;       /* TAB_BAR_* */
+  uint16_t tab_bar_width; /* columns a sidebar takes; ignored for top */
+  /* Where a tab's number goes (TAB_INDEX_*). A sidebar row is wider than the
+   * name on it, and `1:api` spends the start of every row on a number nobody
+   * reads until they want to press it -- against the right edge the names all
+   * start in the same column and the numbers line up as their own column.
+   * Ignored on the top strip, where a tab is only as wide as its label and
+   * there is no room to align anything in. */
+  int tab_bar_index;
+  /* Air inside a sidebar, between its frame and the list in it, per side and
+   * in CELLS: rows above and below, columns left and right. Written as 1, 2
+   * or 4 values in CSS order like `padding`, and in cells rather than
+   * `padding`'s rows-times-gap_aspect, because this is not a ring around a
+   * block of text -- the two sides do different jobs. The columns are an
+   * indent for labels and statuses, and the rows are air above the first tab
+   * and below the last thing in the strip.
+   *
+   * The left column is 1 by default, which is where every label's leading
+   * space used to be hard-coded; 0 puts the names against the frame.
+   *
+   * It is *inside the plate*: a tab's fill still spans the whole row, because
+   * the row is the click target and a highlight that stops short of the edge
+   * reads as a highlighted word rather than a chosen row.
+   *
+   * `tab_bar_pad` is the older name for the top alone and still works; where
+   * both are written the more specific one wins. Ignored for the top strip,
+   * which has exactly one row and no air to give. */
+  uint16_t tab_pad_top, tab_pad_right, tab_pad_bottom, tab_pad_left;
+  /* Blank rows between one tab and the next, so a list of tabs each carrying
+   * a paragraph of status reads as separate entries rather than as one
+   * column of text. Sidebars only: the top strip is a single row, where the
+   * space between tabs is the label's own padding and there is none to give.
+   * Paint, not layout -- the panes' rectangle is the same at 0 as at 3 --
+   * and dropped a row at a time when the list is short of room, because the
+   * gap must never be what costs you the tab it was separating. */
+  uint16_t tab_gap;
+  /* Status rows under each of a sidebar's tabs: what the panes inside said
+   * through OSC 5577 (or how they died), at most this many rows per tab with
+   * an ellipsis when there was more. The sidebar is what makes this possible
+   * at all -- the top strip has one row and no room to say any of it. 0 turns
+   * it off. */
+  uint16_t tab_bar_status;
+  /* How many rows one pane's status may wrap onto, rather than being cut at
+   * the sidebar's width. 1 is the old behaviour and the default: a status is
+   * one row, truncated with an ellipsis.
+   *
+   * Above 1 it is word-wrapped, which buys a narrow sidebar a great deal --
+   * three rows of sixteen cells is forty-eight, and the difference between
+   * "add a summary\u2026" and the whole sentence. The cost is that the rows
+   * under a tab stop being a list of panes and become a paragraph per pane,
+   * so the stripe below is what keeps one pane's status apart from the next
+   * one's. Counts against tab_bar_status the same as any other row. */
+  uint16_t tab_bar_status_lines;
+  /* Frame the sidebar the way panes are framed, so it reads as part of the
+   * chrome rather than as text floating beside it. In compact mode its lines
+   * are shared with the tab area's outer ring -- the same junction-forming
+   * strokes the dividers use -- so the two are one figure. Ignored for top,
+   * which has no chrome to flow into. */
+  bool tab_bar_chrome;
+  bool status_line; /* the line along the bottom: what you are looking at */
+  /* How far the strip and the line are held off the left and right edges.
+   * Separate from `gap`, which is the space around the *panes*: the two happen
+   * to match by default and there is no reason they must. */
+  uint16_t status_pad;
+  bool focus_follows_mouse;
+
+  /* Several terminals may attach to one session at once (the default).
+   * false restores the classic rule: a new client displaces the one before
+   * it, which is what anyone using attach-from-elsewhere as "move my session
+   * here and *close it there*" actually wants. */
+  bool multi_attach;
+  /* Say so when several clients share the session: a small tag in each
+   * client's own top-right corner with the viewer count, and -- on a client
+   * whose view is a crop being panned to follow the active cursor -- the
+   * crop's offset into the shared screen. Per-client chrome, stamped after
+   * projection, which is why it is not part of the shared status bar. */
+  bool attach_indicator;
+  /* Whose size the shared screen takes when several clients are attached:
+   * the active client (newest attach, then last input -- the default), or
+   * the smallest / largest attached one. Smallest is the tmux rule: nobody
+   * is cropped and the roomiest terminal pays in filler; largest gives the
+   * big display everything and small ones a cursor-following crop. */
+  int size_follows;
+
+  /* Whether Ctrl-D at an idle shell prompt exits that shell, the way the tty
+   * line discipline would do it on POSIX.
+   *
+   * Windows has no VEOF: the console driver does not know the character, so
+   * cmd.exe and PowerShell simply ignore it and the one keystroke that closes
+   * a pane everywhere else does nothing. Typing `exit` works, which is the
+   * tell -- the intent was never ambiguous, only unspoken. So slosh speaks it,
+   * and that is exactly what it sends: the pane exits through the same door as
+   * a typed `exit`, with the shell's own cleanup and exit status, and
+   * `keep_dead` decides what is left behind. Closing the pane from outside
+   * would skip all three.
+   *
+   * Off on POSIX, where the line discipline already does this properly and
+   * an emulation could only get in the way -- ^D there is also EOF for `cat`
+   * and every REPL, and none of that is ours to intercept. On for anyone who
+   * wants the same key to mean the same thing on both.
+   *
+   * Narrow on purpose, because a wrong guess costs a pane. It fires only with
+   * the shell itself in the foreground (no child process to be sending EOF
+   * to), on the primary screen (in an editor or a pager ^D is half a page
+   * down), and on an empty line -- where POSIX would send EOF rather than
+   * discard what you typed. */
+  bool ctrl_d_exits;
+
+  /* Whether the program running in a pane may set that pane's shader chains
+   * over OSC 5577. Off, because a program restyling the session it happens to
+   * be running in is a hazard and not a feature (D13) -- and on for anyone
+   * prototyping a chain, because the alternative is edit, save, look, and the
+   * whole point of a colour pass is that you can see it.
+   *
+   * Scoped to the pane that asked: it cannot touch another pane, the chrome
+   * outside itself, or anything the config said about everybody else. */
+  bool in_band_shaders;
+
+  /* What a cell's "terminal default" colour resolves to when a shader has to
+   * compute on it. We cannot know the client's real default, and most text is
+   * default-coloured, so a shader would otherwise leave nearly everything
+   * alone. Only consulted while shading: an unshaded pane still defers to the
+   * terminal exactly as before. */
+  color_t default_fg, default_bg;
+
+  /* theme
+   *
+   * One name per decision. These began as six names doing thirty jobs, which
+   * meant the split guide could not be recoloured without also recolouring the
+   * focused frame, because they were the same entry. Several still share a
+   * default — that is a statement about what looks right together, not about
+   * them being the same thing. */
+
+  /* panes */
+  color_t frame_focus, frame_idle;
+  color_t title_focus, title_idle;
+
+  /* things you can press: the pane's own OSC 5577 buttons */
+  color_t button_fg, button_bg, button_bg_idle;
+
+  /* affordances that appear under the pointer */
+  color_t guide;       /* the split guide: armed edge and dashed boundary */
+  color_t resize;      /* the handle in the gap between two panes */
+  color_t drop_target; /* the frame of a pane a drag could land on */
+
+  /* the scrollback indicator in a pane's frame */
+  color_t scroll_fg, scroll_bg;
+
+  /* rows of a tab that has collapsed into a list */
+  color_t header, header_hover, header_hover_title;
+
+  /* the strip along the top */
+  color_t tab_active_fg, tab_active_bg;
+  /* The active tab keeps its fill while the pointer is on it -- it is still
+   * the tab you are in -- so its hover shows in the text instead. */
+  color_t tab_active_hover_fg;
+  color_t tab_idle, tab_hover;
+  /* The fill under every tab that is not the active one, so a tab reads as a
+   * plate rather than as words floating on the background -- and so the
+   * active tab's fill reads as *this one* against the rest, which is a
+   * comparison it could not make against nothing. Derived 43% of the way from
+   * the background to `tab_idle`, the tab's own label grey, so it stays in a
+   * theme's family without any theme naming it -- and lands at about the same
+   * 1.9:1 against the background whether that background is dark or light.
+   * Set it to the theme's `default_bg` for the bare look. */
+  color_t tab_idle_bg;
+  color_t prefix_fg, prefix_bg; /* the "C-a" badge */
+  color_t tab_count;            /* how many panes in the session */
+  /* The sidebar's status rows. Their distinction from the labels above them
+   * is carried by the slant (see draw_tab_sidebar), because a monochrome
+   * theme has no colour to spend on it; these are for themes that do. A bg of
+   * none leaves the terminal's own background alone, which is what a
+   * translucent one wants. */
+  color_t tab_status_fg, tab_status_bg;
+  /* A status whose program says it is still happening. Brighter than the
+   * ambient one, because "running" and "finished" are the two states worth
+   * telling apart from another tab, and the difference between them should
+   * not be something you have to read the words to work out. Derived from the
+   * theme, like tab_status_fg. */
+  color_t tab_status_busy;
+  /* The spinner beside such a row, which is its own entry because it is its
+   * own decision: the text has to stay readable, and a mark does not -- so a
+   * theme can shout with the glyph and keep the words calm, or the other way
+   * round. Unset it follows tab_status_busy, which is what it looked like
+   * when the two were one colour. */
+  color_t tab_status_spinner;
+  /* The other stripe. With wrapped statuses, where one pane's rows end and
+   * the next one's begin is no longer obvious from the shape -- both are
+   * just italic text down the same column -- so alternate panes sit on
+   * alternate bands. Unset and derived from the theme, like tab_status_fg,
+   * and only ever drawn when a status can actually wrap: a single-row status
+   * has no ambiguity to resolve, and painting a band behind it would take a
+   * translucent terminal's own background away for nothing. */
+  color_t tab_status_stripe;
+
+  /* the line along the bottom */
+  color_t status, status_state;
+
+  /* the pane finder */
+  color_t finder_fg, finder_bg, finder_sel_fg, finder_sel_bg;
+
+  /* scrollback search: every match on screen is tinted `search_*`, and the one
+   * the bar is on is tinted `search_cur_*` instead, so "all of them" and "this
+   * one" read as two things rather than one. */
+  color_t search_fg, search_bg, search_cur_fg, search_cur_bg;
+
+  /* the in-place editor a double-click opens on a pane's title */
+  color_t rename_fg, rename_bg;
+
+  /* the bell mark in a pane's titlebar */
+  color_t bell;
+
+  /* what a dead pane says: the line in its backlog, and the word in the
+   * status line and its own frame */
+  color_t dead;
+
+  /* the frame's own buttons */
+  color_t pane_button, pane_button_hover;
+
+  /* the row of minimised panes along the bottom */
+  color_t minbar, minbar_hover;
+
+  /* the hint in the middle of the status line */
+  color_t hint;
+
+  /* Modals: a surface that floats over the layout, with its own frame. Named
+   * separately from the pane colours it resembles because it is a different
+   * *surface* — it sits on top of everything, it is opaque, and it has to
+   * stay legible against a background that has been dimmed underneath it.
+   * Borrowing the pane button colour here is what made the close button
+   * invisible: dim on dim. */
+  color_t modal_fg, modal_bg;
+  color_t modal_border, modal_title;
+  color_t modal_button, modal_button_hover;
+
+  /* announcements */
+  color_t toast_fg, toast_bg;
+
+  /* the multi-client tag ("2 clients", per-client top-right chrome). Muted
+   * by default: it is standing information, not an announcement. */
+  color_t attach_fg, attach_bg;
+
+  /* keys */
+  int prefix_key;
+  uint16_t prefix_mods;
+  binding_t *binds;
+  size_t nbinds;
+
+  /* Every amount expression this config compiled. A shader_t is copied by
+   * value all over the place and several copies can point at one program, so
+   * ownership lives here — with the config that parsed them, freed when it is
+   * replaced. */
+  expr_prog_t **exprs;
+  size_t nexprs;
+
+  /* what a new pane runs; NULL means $SHELL */
+  char *shell;
+  /* What `edit-config` opens the file with; NULL means $EDITOR, then vi. */
+  char *editor;
+
+  /* Where projects live: `project_roots "~/dev" "~/work" depth=2`. A project is
+   * a subdirectory of one of these with a `slosh.layout` in it -- or a
+   * `.git`, which gets `project_layout` instead. Empty means the feature is
+   * dormant and costs nothing.
+   *
+   * `depth` is levels below each root, and a directory that *is* a project is
+   * never descended into, so 2 covers `~/dev/work/api` without walking any
+   * checkout's insides. */
+  char *project_roots[PROJECT_ROOTS_MAX];
+  size_t nproject_roots;
+  int project_depth;
+
+  /* Named themes. `theme_name "phosphor"` reads `phosphor.kdl` out of the
+   * theme directory and applies it *before* the rest of the file, exactly as
+   * an include does: the theme is the base, anything you write beside it
+   * wins. NULL is "nobody asked", and the compiled-in palette stands.
+   *
+   * `theme_dir` is where to look, resolved against the file that said it when
+   * it is relative; NULL means the pair of directories config_theme_dirs
+   * derives -- `themes/` beside your config, then the ones `make install`
+   * put in `<prefix>/share/slosh/themes`. Two rather than one so a theme that
+   * ships with slosh is reachable by name without being copied first, and a
+   * theme of yours with the same name shadows it. */
+  char *theme_dir;
+  char *theme_name;
+
+  /* Which colours were named by hand rather than inherited from the theme the
+   * config asked for, indexed like the table in config.c. Only the dump reads
+   * it, and only so that `--dump-config` can write `theme_name` plus your two
+   * overrides instead of freezing sixty resolved colours into a file -- which
+   * would pin the theme's palette at the moment you dumped it and quietly
+   * make every later change to that theme invisible. */
+  bool theme_set[THEME_COLORS_MAX];
+  /* Loader scratch: true while a named theme file is being read, which is how
+   * the flags above tell "the theme said it" from "you said it". */
+  bool in_theme;
+
+  /* The layout a project with no file of its own opens as. Yours rather than a
+   * guess about your stack: relative paths in it bind to whichever project is
+   * being opened, so one file is the shape you start every project in. NULL is
+   * one pane running your shell. */
+  char *project_layout;
+
+  /* Every file this config was built from, in the order they were read: the one
+   * that was loaded and everything it included, whether or not each existed.
+   * Kept because the watcher needs it — a theme you can include is a theme you
+   * expect to reload when you save it — and recorded even for a file that is
+   * not there, so a session started before you wrote one still notices it
+   * appearing. */
+  char *files[CONFIG_FILES_MAX];
+  size_t nfiles;
+
+  /* Everything this load had to complain about, in the order it found them,
+   * each already carrying the file and line it happened at. A session shows the
+   * first (there is one status line); `--check` shows them all, which is the
+   * whole difference between a warning and a linter. */
+  char msgs[CONFIG_MSGS_MAX][192];
+  size_t nmsgs;
+
+  /* Loader scratch: the file being read right now, so a complaint can say which
+   * one it came from without every call site being handed the path. Meaningless
+   * once loading has finished. */
+  const char *loading;
+} config_t;
+
+/* Defaults, then <config dir>/config.kdl on top. Never fails: on a bad file
+ * it keeps the defaults and writes the reason to `err`. */
+void config_defaults(config_t *c);
+bool config_load(config_t *c, const char *path, char *err, size_t errcap);
+
+/* Apply a named theme over a config that is already loaded, as if the config
+ * had asked for it: the same lookup, the same file, the same derivations. How
+ * a live theme switch is made, and why switching is not a special path through
+ * the loader -- a theme applied at runtime and one named in a config have to
+ * end up at the same palette, or the session and its file disagree. */
+bool config_apply_theme(config_t *c, const char *name, char *err,
+                        size_t errcap);
+
+/* Where named themes are looked for, in order. Absolute and expanded. */
+size_t config_theme_dirs(const config_t *c, char (*out)[512], size_t max);
+
+/* Every theme that can be named, sorted, each one listed once -- a name in an
+ * earlier directory shadows the same name in a later one, which is what makes
+ * a theme of yours able to replace a shipped one. */
+size_t config_themes(const config_t *c, char (*out)[THEME_NAME_MAX],
+                     size_t max);
+
+/* Write `theme_name "x"` into a config file, replacing the line already there
+ * or adding one. For a switch somebody asked to keep: the session can hold a
+ * theme for itself, but only the file can hold it past a restart. */
+bool config_write_theme_name(const char *path, const char *name, char *err,
+                             size_t errcap);
+/* $SLOSH_CONFIG, else $XDG_CONFIG_HOME/slosh/config.kdl, else ~/.config/… */
+const char *config_default_path(void);
+/* Every complaint from the last load, oldest first: "config.kdl:12: ...".
+ * Returns how many were written. */
+size_t config_messages(const config_t *c, const char **out, size_t max);
+void config_free(config_t *c);
+/* The files this config was read from, oldest first: `files[0]` is the one that
+ * was loaded, the rest are what it included. Returns how many were written. */
+size_t config_files(const config_t *c, const char **out, size_t max);
+
+/* Shader chains from text rather than from a file: one entry, several separated by
+ * `;`, or a whole `shaders { ... }` block. Every shape a config file has, because
+ * the point of using the config's syntax at a prompt is that the two directions
+ * match -- what you prototype is what you paste, and what you paste is something
+ * you can type back.
+ *
+ * Each pass goes where its own `where=` says; `default_chrome` is only what a pass
+ * that keeps quiet means. Here because the parser belongs with the config: a chain
+ * typed at a running pane and a chain in a config file have to mean the same
+ * thing, or prototyping teaches you something that then does not work.
+ *
+ * Both arrays hold SHADE_MAX and `exprs` twice that; the compiled programs belong
+ * to the caller, since a pane's chain outlives no load in particular. Returns how
+ * many entries were understood, writing the first refusal to `err`. */
+size_t config_parse_chain_doc(const char *text, color_t default_color,
+                              bool default_chrome, shader_t *content,
+                              size_t *ncontent, shader_t *chrome,
+                              size_t *nchrome, expr_prog_t **exprs,
+                              size_t *nexprs, char *err, size_t errcap);
+
+/* The same, from a file: a `shaders { }` block as `contrib/chrome` and
+ * `contrib/shaders` ship them, read with the parser that already knows this
+ * format. Entries are routed to the two chains by their own `where=`, defaulting
+ * to content as a config file does, so a preset lands where its author said.
+ * Anything else at the top level is ignored -- hand it a whole config.kdl and
+ * only the shaders apply. Both arrays hold SHADE_MAX; `exprs` holds twice that.
+ * Returns how many entries were understood. */
+size_t config_parse_chain_file(const char *path, color_t default_color,
+                               shader_t *content, size_t *ncontent,
+                               shader_t *chrome, size_t *nchrome,
+                               expr_prog_t **exprs, size_t *nexprs, char *err,
+                               size_t errcap);
+
+/* Whether a name is one of the config's own settings. For the layout loader, which
+ * shares this syntax and needs to tell a config apart from a session file -- one
+ * list, so the two answers cannot disagree. */
+bool config_is_setting(const char *name);
+
+/* What a chord does after the leader. Direct bindings answer here too, so
+ * pressing the leader first never makes a binding stop working. */
+action_t config_lookup(const config_t *c, int key, uint16_t mods);
+/* What a chord does on its own, with no leader pressed. ACT_NONE for the
+ * overwhelming majority of keys, which is what lets them reach the pane. */
+action_t config_lookup_direct(const config_t *c, int key, uint16_t mods);
+/* Whether any binding fires without the leader, so the cheatsheet knows
+ * whether it has a section to draw. */
+bool config_has_direct(const config_t *c);
+/* The reverse of config_parse_chord: what to call a binding on screen. A
+ * shifted letter is written the way you would type it ("H"), because "S-h" is
+ * a description of a keystroke rather than a keystroke. */
+void config_chord_name(int key, uint16_t mods, char *out, size_t cap);
+/* A phrase for the cheatsheet, and which group it belongs under. `group` is
+ * one of a fixed set, in the order they should be shown. */
+const char *config_action_label(action_t a);
+/* The name this action is written as in a config file. */
+const char *config_action_name(action_t a);
+/* The whole config as a file you could have written, with the values it
+ * currently holds. Generated rather than kept on disk, because a checked-in
+ * copy of the defaults is a second source of truth and drifts. Caller frees. */
+char *config_render(const config_t *c);
+/* The same, for a config nobody has edited: what a fresh install would do.
+ * Caller frees. */
+char *config_dump_defaults(void);
+/* The palette in force as a theme file, which is how a theme is started from
+ * the one you are looking at. The config dump writes `theme_name` rather than
+ * sixty colours, so this is the only place they are all spelled out. */
+char *config_render_theme(const config_t *c);
+char *config_dump_theme(void);
+const char *config_action_group(action_t a);
+/* "ctrl+a", "alt+left", "\\", "f" -> key + mods. False if unparseable. */
+bool config_parse_chord(const char *text, int *out_key, uint16_t *out_mods);
+
+#endif /* SLOSH_CONFIG_H */

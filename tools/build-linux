@@ -1,0 +1,24 @@
+#!/bin/sh
+# Build a static musl executable with Rust's bundled linker and the Zig VT core.
+# Prerequisites: Rust with the selected musl target, Zig 0.16, and libclang.
+# Usage: tools/build-linux x86_64|aarch64 [Cargo build arguments...]
+set -eu
+arch=${1:-}
+case "$arch" in
+    x86_64|aarch64) shift ;;
+    *) echo "usage: $0 x86_64|aarch64 [Cargo build arguments...]" >&2; exit 2 ;;
+esac
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+rust_host=$(rustc -vV | sed -n 's/^host: //p')
+rust_sysroot=$(rustc --print sysroot)
+rust_linker="$rust_sysroot/lib/rustlib/$rust_host/bin/rust-lld"
+if [ ! -x "$rust_linker" ]; then
+    echo "Rust's bundled linker is missing: $rust_linker" >&2
+    exit 1
+fi
+case "$arch" in
+    x86_64) export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$rust_linker" ;;
+    aarch64) export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$rust_linker" ;;
+esac
+exec cargo build --offline --manifest-path "$project_dir/Cargo.toml" \
+    --target "$arch-unknown-linux-musl" "$@"

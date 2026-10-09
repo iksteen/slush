@@ -1,0 +1,3 @@
+# Preserve the exact bytes of pinned upstream sources and Zig hash-addressed packages.
+/vendor/** -text
+/tests/reference/** -text

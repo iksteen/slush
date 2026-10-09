@@ -1,0 +1,398 @@
+/* slosh — common types. See DESIGN.md. */
+#ifndef SLOSH_H
+#define SLOSH_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+
+#include "input.h"
+/* osc7501_t: a pane carries the program status its program last reported, and
+ * both the control API and the drawing code read it. */
+#include "osc5577.h"
+/* cell_t, color_t and the ATTR_* flags live in the shader ABI, because that is
+ * the one place they are a *contract* with code compiled outside this tree. */
+#include "shader_abi.h"
+
+/* A rectangle of cells. Here rather than in app.h because the layout is not
+ * the only thing that has one: a shader pass is given a rect to run over, and
+ * the frame pass is given the rect it must skip. */
+typedef struct {
+  uint16_t x, y, w, h;
+} rect_t;
+
+/* ---- screen: our composited cell buffer + diff emitter ---------------- */
+
+/* One geometry (DESIGN.md): every painted interactive element records its rect
+ * here as it is painted, and a click is a lookup. Drawing and hit-testing
+ * cannot disagree because there is only one of them. */
+typedef struct {
+  uint16_t x, y, w, h;
+  char action[48];
+} hit_t;
+
+typedef struct {
+  hit_t *items;
+  size_t len, cap;
+} hitlist_t;
+
+void hit_reset(hitlist_t *hl);
+void hit_add(hitlist_t *hl, uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+             const char *action);
+/* The action at a point, or NULL. Later entries win: painted last is on top. */
+const char *hit_test(const hitlist_t *hl, uint16_t x, uint16_t y);
+/* The rect a named action was registered with, or NULL: for a caller that must
+ * grow or paint over an entry some other pass placed. */
+const hit_t *hit_find(const hitlist_t *hl, const char *action);
+
+typedef struct {
+  uint16_t cols, rows;
+  cell_t *cur;  /* what we want on screen */
+  cell_t *prev; /* what the terminal last received */
+  /* OSC 8 hyperlinks, carried beside the cells rather than in them: cell_t
+   * is the shader ABI and a link is not a colour. 0 is no link; anything
+   * else is 1+index into `links`. The table is append-only for the screen's
+   * lifetime, so an id in `prev_link` still means the same URI next frame —
+   * which is what lets the diff compare ids instead of strings — and it is
+   * capped, because a hostile pane must not be able to grow it forever: a
+   * link past the cap is dropped, which costs a click and nothing else. */
+  uint16_t *cur_link, *prev_link;
+  char **links;
+  size_t nlinks;
+  bool force_full;
+  hitlist_t hits;
+
+  /* where the real cursor goes after a flush */
+  bool cursor_visible;
+  uint16_t cursor_x, cursor_y;
+  /* what the terminal was last told, so an unchanged frame emits nothing */
+  bool shown_cursor_visible;
+  uint16_t shown_cursor_x, shown_cursor_y;
+
+  /* output accumulator, flushed in one write() */
+  char *out;
+  size_t out_len, out_cap;
+} screen_t;
+
+void screen_init(screen_t *s, uint16_t cols, uint16_t rows);
+void screen_free(screen_t *s);
+void screen_resize(screen_t *s, uint16_t cols, uint16_t rows);
+void screen_clear(screen_t *s);
+/* Project a canonical screen into a client-sized one. The source starts at
+ * (x,y); anything beyond its edges is blank filler. Diff history in `dst` is
+ * deliberately left alone, so every attached terminal advances independently. */
+void screen_project(screen_t *dst, const screen_t *src, uint16_t x, uint16_t y);
+/* Move an existing client viewport only as far as needed to keep the canonical
+ * cursor visible, then clamp it to the canonical screen. */
+void screen_follow_cursor(const screen_t *src, uint16_t cols, uint16_t rows,
+                          uint16_t *x, uint16_t *y);
+cell_t *screen_at(screen_t *s, uint16_t x, uint16_t y);
+void screen_put_utf8(screen_t *s, uint16_t x, uint16_t y, const char *txt,
+                     size_t len, color_t fg, color_t bg, uint16_t attrs);
+/* Columns one grapheme cluster occupies, from lib-vt's own width table. */
+uint8_t screen_width_of(const char *txt, size_t len);
+/* Columns a whole string occupies. What chrome must budget with. */
+uint16_t screen_cells(const char *txt);
+/* Write a UTF-8 string; returns the *columns* written, which is not the number
+ * of characters when any of them is wide. */
+uint16_t screen_text(screen_t *s, uint16_t x, uint16_t y, const char *txt,
+                     color_t fg, color_t bg, uint16_t attrs);
+/* Intern a hyperlink URI into this screen's table: an id for screen_set_link,
+ * or 0 for none — an empty URI, one with control bytes in it, or a full
+ * table all answer 0, because a link that cannot be emitted safely is a link
+ * the frame does not carry. */
+uint16_t screen_link_id(screen_t *s, const char *uri, size_t len);
+void screen_set_link(screen_t *s, uint16_t x, uint16_t y, uint16_t id);
+/* Diff cur against prev into s->out (the minimal byte stream for a terminal). */
+void screen_render(screen_t *s);
+/* screen_render, then write it to fd. */
+void screen_flush(screen_t *s, int fd);
+/* Plain-text dump of the composited screen; caller frees. (headless tests) */
+char *screen_dump(screen_t *s);
+/* The same screen as JSON: rows of text, style runs, cursor, hit-list. */
+char *screen_dump_json(screen_t *s);
+
+/* ---- paths -------------------------------------------------------------- */
+
+/* Whether a path stands on its own. A leading `/` everywhere; on Windows also
+ * a drive (`C:\dir`, `C:/dir`), a drive-relative root (`\dir`) and a UNC
+ * share. Drive letters are read as such only on Windows, because `C:` is an
+ * ordinary file name on POSIX. */
+bool path_is_absolute(const char *path);
+/* Expand a leading `~`, using `buf` when it has to. Returns `path` itself when
+ * there is nothing to do, so `buf` only has to outlive the result's use. */
+const char *path_expand(const char *path, char *buf, size_t cap);
+/* `~`, then a relative path against `base` -- the directory the file that wrote
+ * it lives in, so a layout checked in with a project can say `cwd="."`. A NULL
+ * or empty `base` leaves a relative path alone, which is what it meant before
+ * there was a base to be relative to. */
+const char *path_resolve(const char *path, const char *base, char *buf,
+                         size_t cap);
+/* The directory part of a path: the base `path_resolve` wants. `.` when there
+ * is no separator in it. On Windows a backslash separates too. */
+const char *path_dir(const char *path, char *buf, size_t cap);
+/* The name part: the other half of `path_dir`, pointing into `path`. */
+const char *path_base(const char *path);
+/* The inverse of `path_resolve` for writing one back out: a path under `base`
+ * relative to it, `.` for `base` itself, and anything not under it unchanged.
+ * Points into `path` or a literal, so it needs no buffer. */
+const char *path_relative(const char *path, const char *base);
+/* mkdir -p, for the directory a config or a session socket wants to live in. */
+bool path_mkdirs(const char *dir);
+/* This binary's own path, from the kernel rather than from argv[0]. What lets
+ * slosh find the files installed beside it without being told where they are. */
+bool path_self(char *out, size_t cap);
+
+/* ---- the shell a pane gets when nothing else is said -------------------- */
+
+/* One spelling of "run this command line through a shell", because three
+ * places need it and a Windows box has neither /bin/sh nor -c. SHELL is not
+ * set on Windows either, so ComSpec is what stands in for it (see
+ * default_argv). */
+#ifdef _WIN32
+#define SLOSH_SHELL_DEFAULT "cmd.exe"
+#define SLOSH_SHELL_CFLAG "/c"
+#else
+#define SLOSH_SHELL_DEFAULT "/bin/sh"
+#define SLOSH_SHELL_CFLAG "-c"
+#endif
+
+/* ---- pty --------------------------------------------------------------- */
+
+typedef struct {
+  int fd;
+  pid_t pid;
+} pty_t;
+
+/* `cell_w`/`cell_h` are the client's cell size in pixels, so the pty's
+ * winsize carries real pixel dimensions: a program that draws images asks the
+ * tty how big a cell is, and zeroes there mean it cannot size one. */
+/* Write the embedded xterm-ghostty terminfo into ~/.terminfo (0 on
+ * success). Panes do this on their own when the entry is missing
+ * everywhere; `slosh --install-terminfo` is the by-hand spelling. */
+int pty_terminfo_install(void);
+/* `pane_id` is the id the session knows this pane by, exported into the child
+ * as $SLOSH_PANE. A program in a pane has to be able to name the pane it is
+ * *in* -- `panes` says which pane is focused, and focus is the human's, not the
+ * caller's, so anything that inferred "where do I live" from it spawned its
+ * work in whichever tab somebody else happened to be looking at. tmux answers
+ * this with $TMUX_PANE and zellij with $ZELLIJ_PANE_ID; this is ours. 0 means
+ * "no id", and then the variable is left unset rather than set to a lie. */
+int pty_spawn(pty_t *p, const char *const argv[], uint16_t cols, uint16_t rows,
+              const char *cwd, uint16_t cell_w, uint16_t cell_h,
+              uint32_t pane_id);
+int pty_resize(pty_t *p, uint16_t cols, uint16_t rows, uint16_t cell_w,
+               uint16_t cell_h);
+void pty_close(pty_t *p);
+
+/* ---- pane: a pty + a libghostty-vt terminal ---------------------------- */
+
+typedef struct pane pane_t;
+
+/* An OSC 5577 action button drawn in a pane's frame. */
+typedef struct {
+  char id[33];
+  char label[33];
+} pane_button_t;
+
+/* Verbs pane.c does not handle itself (purpose, and whatever comes later). */
+typedef void (*pane_osc_fn)(pane_t *p, const char *verb, const char *payload,
+                            void *ud);
+/* A program in the pane wrote the clipboard (OSC 52). Takes ownership. */
+typedef void (*pane_clip_fn)(pane_t *p, char *text, void *ud);
+/* A program in the pane sent a notification (OSC 9 / OSC 777). */
+typedef void (*pane_notify_fn)(pane_t *p, const char *title, const char *body,
+                               void *ud);
+
+/* `id` is what the session will know this pane by: it reaches the program as
+ * $SLOSH_PANE, and every respawn of this pane (start/rerun) carries the same
+ * one, so a pane's identity outlives the process that had it. */
+pane_t *pane_new(const char *const argv[], uint16_t cols, uint16_t rows,
+                 const char *cwd, uint32_t id);
+/* `suspended`: create the pane but run nothing until pane_start(). `label` is
+ * what to show in the meantime (usually the command line). */
+pane_t *pane_new_ex(const char *const argv[], uint16_t cols, uint16_t rows,
+                    const char *cwd, bool suspended, const char *label,
+                    uint32_t id);
+bool pane_suspended(const pane_t *p);
+/* A pane opened to do one thing, rather than one the session is made of: an
+ * editor you popped open, not the dev server a layout declared. It runs a
+ * command like any other, but when that command ends it is finished — so it
+ * keeps no corpse and is not written into a dumped layout. */
+void pane_set_ephemeral(pane_t *p, bool yes);
+bool pane_ephemeral(const pane_t *p);
+const char *pane_label(const pane_t *p);
+/* The pid of the program in the pane, or -1. Used to ask the kernel where a
+ * shell has got to, which is the only honest answer to "what is this pane's
+ * directory" once somebody has typed `cd`. */
+pid_t pane_pid(const pane_t *p);
+/* Where it was started, which is not where it *is*: see pane_pid(). */
+const char *pane_start_cwd(const pane_t *p);
+/* What the pane's terminal is running now, as a command line, or NULL when the
+ * answer is "your shell, at a prompt". Read from the pty's foreground process
+ * group, so it is the job that owns the terminal rather than a guess: `label`
+ * only knows what a layout said, which left a pane you split and typed a command
+ * into with nothing to write down. Shell-quoted, because `command=` is run
+ * through `/bin/sh -c`. */
+const char *pane_foreground(const pane_t *p, char *buf, size_t cap);
+/* How much history the pane keeps: a line count, and a byte ceiling that stops
+ * one wide, heavily styled pane from spending the machine to honour it. 0 lines
+ * is no scrollback; 0 bytes is no ceiling. Both are estimates -- lib-vt prunes a
+ * page at a time, so a pane keeps a little more than it was told, never less --
+ * and lowering either drops history at once, which is what makes this safe to
+ * apply to a running pane. */
+void pane_set_scrollback(pane_t *p, size_t lines, size_t bytes);
+bool pane_start(pane_t *p);
+void pane_free(pane_t *p);
+int pane_fd(const pane_t *p);
+bool pane_alive(const pane_t *p);
+/* How the program ended, for a pane that is no longer alive. `code` is the
+ * exit status, or the signal number when `signaled`. False while it is still
+ * running, and also when the status could not be collected — a pane can be
+ * known to be gone without it being known why. */
+bool pane_exit(const pane_t *p, int *code, bool *signaled);
+/* Run the pane's command again, in the same pty-less pane: same argv, same
+ * cwd, same terminal, so the previous run stays above in the scrollback.
+ * False if the pane is still alive or the spawn failed. */
+bool pane_restart(pane_t *p);
+/* Write a line into the pane's own terminal — the backlog, not the pty (which
+ * by the time this is wanted is closed). It scrolls with the output it
+ * followed, which is the point: it is a thing that happened to this pane. */
+void pane_note(pane_t *p, const char *text, color_t fg);
+/* Read available pty output into the terminal. Returns bytes read, 0 on EOF,
+ * -1 on error (EAGAIN is reported as 0 bytes with alive still true). A pane
+ * that reaches EOF stops being alive here and closes its pty, but keeps its
+ * terminal: a dead pane is still a pane with contents you can read. */
+ssize_t pane_pump(pane_t *p);
+void pane_write(pane_t *p, const void *buf, size_t len);
+/* Re-encode a decoded event against this pane's own negotiated modes. */
+void pane_send_key(pane_t *p, const input_event_t *ev);
+void pane_send_mouse(pane_t *p, const input_event_t *ev);
+void pane_send_paste(pane_t *p, const char *text, size_t len);
+void pane_resize(pane_t *p, uint16_t cols, uint16_t rows);
+/* The client's cell size in pixels. Everything about images depends on it:
+ * without it a placement that asks for its natural size covers zero cells and
+ * is dropped, which is a picture that silently does not appear. */
+void pane_set_cell_px(pane_t *p, uint16_t w, uint16_t h);
+bool pane_dirty(pane_t *p);
+/* Ask for a repaint without having changed a cell: what is drawn *over* the
+ * pane changed, and composing is the only thing that can see that. */
+void pane_touch(pane_t *p);
+/* Free the pane's retained render snapshot (~140KB for 80x24). Safe at any
+ * time: the next render rebuilds it from the terminal. Called for panes on
+ * tabs that are not on screen. */
+void pane_render_cache_drop(pane_t *p);
+/* Scrollback. Negative delta scrolls up (towards older output). */
+void pane_scroll(pane_t *p, int delta);
+void pane_scroll_edge(pane_t *p, bool top);
+bool pane_scrolled(const pane_t *p);
+void pane_scroll_pos(const pane_t *p, uint32_t *above, uint32_t *total);
+/* Scrollback search, on lib-vt's machinery. Set a needle to search for it
+ * (empty or NULL clears); the viewport follows the current match as it moves.
+ * `step` moves through the matches -- `older` is up into history -- wrapping
+ * at either end. `refresh` catches up with a terminal that has kept printing,
+ * once per composed frame while a search is open. `pos` is the "k of n": true
+ * with `idx` (0-based, newest first) when a match is selected, `total` filled
+ * either way. */
+void pane_search_set(pane_t *p, const char *needle);
+bool pane_search_step(pane_t *p, bool older);
+void pane_search_refresh(pane_t *p);
+bool pane_search_pos(const pane_t *p, size_t *idx, size_t *total);
+void pane_search_close(pane_t *p);
+
+/* One on-screen match, in the pane's viewport coordinates: a run of columns
+ * `x0`..`x1` on `row`. A match that wraps a row comes back as one mark per
+ * row it covers. `current` is the one the bar is on -- the one the counter
+ * counts to and the keys step from -- so a caller can tint it apart from the
+ * rest. Fill `out` up to `max`; returns how many. Read after a refresh, drawn
+ * before the terminal changes again. */
+typedef struct {
+  uint16_t row, x0, x1;
+  bool current;
+} pane_mark_t;
+size_t pane_search_marks(const pane_t *p, pane_mark_t *out, size_t max);
+bool pane_alt_screen(const pane_t *p);
+/* Whether the line being typed looks empty, counted from the keys forwarded
+ * since the last Enter. An estimate: the shell's line editor is on the far
+ * side of the pty and cannot be asked. Only ctrl_d_exits reads it, and only
+ * to refuse -- see the field in pane.c for which way it errs. */
+bool pane_line_empty(const pane_t *p);
+bool pane_wants_mouse(const pane_t *p);
+const char *pane_title(const pane_t *p);
+/* A BEL arrived and the pane has not been looked at since. */
+bool pane_bell(const pane_t *p);
+void pane_clear_bell(pane_t *p);
+/* The user-assigned name, "" when the program's title is showing through. */
+const char *pane_name(const pane_t *p);
+/* "" clears the name and gives the pane back to the program's title. */
+void pane_set_name(pane_t *p, const char *name);
+const char *pane_status(const pane_t *p);
+/* Whether the program says what its status describes is still happening
+ * (`busy` over OSC 5577). Never true of a pane whose program has gone: a
+ * status left behind by something that exited is a description of the past,
+ * whatever it last claimed. */
+bool pane_status_busy(const pane_t *p);
+/* The OSC 7501 record the status above was composed from, or NULL when no
+ * program in this pane has reported one (or 5577 has since taken the slot:
+ * they share it, last writer wins). `app` is resolved from the record's
+ * nearest ancestor that has one, the way the protocol asks. */
+const osc7501_t *pane_program_status(const pane_t *p);
+size_t pane_buttons(const pane_t *p, const pane_button_t **out);
+void pane_click_button(pane_t *p, const char *id);
+void pane_set_osc_handler(pane_t *p, pane_osc_fn fn, void *ud);
+void pane_set_clipboard_handler(pane_t *p, pane_clip_fn fn, void *ud);
+void pane_set_notify_handler(pane_t *p, pane_notify_fn fn, void *ud);
+
+/* One visible kitty graphics placement, in the pane's viewport coordinates. */
+typedef struct {
+  uint32_t image_id, place_id;
+  uint16_t col, row, cols, rows;
+  /* Where the image starts inside its first cell, in pixels. Sub-cell
+   * positioning: what a program moving something smoothly relies on, and the
+   * difference between motion and a slideshow. */
+  uint32_t x_off, y_off;
+  /* What the program asked to scale into, or 0 for "draw it at its natural
+   * size". The difference matters on the way out: naming a cell count tells
+   * the terminal to *scale* the image into it, and the count a natural
+   * placement happens to cover changes by one as it slides across a cell
+   * boundary — so passing it on makes a moving image change size. */
+  uint16_t req_cols, req_rows;
+  uint32_t px_w, px_h;   /* rendered size */
+  uint32_t src_w, src_h; /* the image's own size */
+  /* The part of the image to draw, in pixels. Clipping has to move this:
+   * asking for fewer columns alone *scales* the image into them, it does not
+   * crop it. */
+  uint32_t sx, sy, sw, sh;
+  uint32_t cell_px_w, cell_px_h; /* derived: rendered pixels per cell */
+  int format, compression;
+  uint64_t generation;
+  const uint8_t *data; /* borrowed for the callback only */
+  size_t data_len;
+} pane_gfx_t;
+
+typedef void (*pane_gfx_fn)(pane_t *p, const pane_gfx_t *g, void *ud);
+size_t pane_graphics(pane_t *p, pane_gfx_fn cb, void *ud);
+
+/* Selection, in the pane's viewport coordinates. The anchor start() takes is
+ * kept as a tracked grid ref, so extend() keeps meaning the cell that was
+ * pressed even after the viewport has scrolled under the drag. */
+void pane_select_start(pane_t *p, uint16_t x, uint16_t y);
+void pane_select_extend(pane_t *p, uint16_t x, uint16_t y);
+void pane_select_clear(pane_t *p);
+/* Select the word under a viewport cell, with `seps` naming what a word stops
+ * at. False when there is no word there -- blank, a separator, past the end of
+ * the row -- and then the selection is left alone. */
+bool pane_select_word(pane_t *p, uint16_t x, uint16_t y, const char *seps);
+void pane_select_done(pane_t *p);
+bool pane_selecting(const pane_t *p);
+char *pane_selection_text(pane_t *p);
+/* The pane's whole viewport as plain text, for a pane in any tab and with no
+ * side effects: no focus change, no tab change, and the human's selection left
+ * alone. Caller frees. NULL when there is nothing to read. */
+char *pane_viewport_text(pane_t *p);
+/* Compose this pane's viewport into the screen at (x0,y0). Clears dirty. */
+void pane_compose(pane_t *p, screen_t *s, uint16_t x0, uint16_t y0,
+                  bool focused);
+
+#endif /* SLOSH_H */

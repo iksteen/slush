@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Big kitty images over the real socket, with a reader that stalls.
+
+The headless suite proves the graphics *model*; this proves the delivery path
+it cannot see: a pane image is re-emitted to the client as decoded RGBA, which
+is megabytes of base64 in one indivisible message. Two bugs lived there, both
+invisible headless:
+
+  - the outbox cap was applied to backlog *plus message*, so a message bigger
+    than the cap was silently undeliverable forever -- and the model advanced
+    anyway, losing the deletions that rode in the dropped frame. The visible
+    symptom was a screenshot parked at a fixed spot on the screen, immune to
+    scrolling, forever.
+  - once the cap bounded only the backlog, a queued image legitimately held
+    the backlog over the cap until it drained -- and push_frame read that as
+    a dead client and closed the connection. The visible symptom was the
+    session auto-detaching whenever an image crossed the wire.
+
+So: a pane draws an image whose transmission exceeds MAX_OUTBOX, while the
+client reads nothing. The session must stay attached, the whole transmission
+must arrive once the reader comes back, and scrolling the image away must
+deliver its deletion.
+"""
+
+import fcntl
+import os
+import pty
+import re
+import select
+import struct
+import sys
+import termios
+import time
+import uuid
+
+BIN = os.environ.get(
+    "SLOSH_BIN", os.path.join(os.path.dirname(__file__), "..", "build", "slosh")
+)
+SESSION = "test-" + uuid.uuid4().hex[:8]
+
+# 1100x1000 RGB is 3.3MB raw, 4.4MB as base64: bigger than the server's 4MB
+# outbox cap, so delivery *requires* the cap to bound backlog, not messages.
+CHILD = r"""
+import base64, sys, time
+w, h = 1100, 1000
+img = base64.b64encode(bytes([200, 60, 60]) * (w * h)).decode()
+sys.stdout.write("\x1b_Ga=T,f=24,q=2,s=%d,v=%d,i=7,c=40,r=10,m=1;\x1b\\" % (w, h))
+for off in range(0, len(img), 4096):
+    last = off + 4096 >= len(img)
+    sys.stdout.write("\x1b_Gm=%d;%s\x1b\\" % (0 if last else 1, img[off:off+4096]))
+sys.stdout.write("\r\nIMG-SENT\r\n")
+sys.stdout.flush()
+time.sleep(2)  # visible for a few frames, like a screenshot you read past
+for i in range(200):
+    sys.stdout.write("line %d\r\n" % i)  # ...and then scrolled away
+sys.stdout.flush()
+time.sleep(30)
+"""
+
+
+# A small image that stays put while the screen around it changes: the counter
+# repaints one line in place (\r, no newline), so nothing scrolls and the
+# picture neither moves nor changes. Every frame it provokes is a frame that
+# must NOT say the placement again.
+STILL = r"""
+import base64, sys, time
+px = base64.b64encode(bytes([255, 0, 0] * 8)).decode()  # 4x2 RGB
+sys.stdout.write("\x1b_Ga=T,f=24,q=2,s=4,v=2,i=7,c=6,r=2;%s\x1b\\\r\n" % px)
+sys.stdout.flush()
+for i in range(120):
+    sys.stdout.write("tick %d   \r" % i)
+    sys.stdout.flush()
+    time.sleep(0.02)
+time.sleep(30)
+"""
+
+
+# One image, two placements, then the pixels replaced -- which deletes both
+# placements on the client, so the program says them again, same geometry.
+# Both must reach the client again: "unchanged" is measured against what the
+# client is holding, and after a retransmit it is holding neither.
+REPLACED = r"""
+import base64, sys, time
+px1 = base64.b64encode(bytes([255, 0, 0] * 8)).decode()  # 4x2 red
+px2 = base64.b64encode(bytes([0, 255, 0] * 8)).decode()  # 4x2 green
+def both(px):
+    sys.stdout.write("\x1b[1;1H")
+    sys.stdout.write("\x1b_Ga=t,f=24,q=2,s=4,v=2,i=7;%s\x1b\\" % px)
+    sys.stdout.write("\x1b_Ga=p,i=7,p=1,q=2,c=6,r=2\x1b\\")
+    sys.stdout.write("\x1b[1;20H")
+    sys.stdout.write("\x1b_Ga=p,i=7,p=2,q=2,c=6,r=2\x1b\\")
+    sys.stdout.flush()
+both(px1)
+time.sleep(2)
+both(px2)
+time.sleep(30)
+"""
+
+
+def spawn(cols=80, rows=24, child=None, session=None):
+    pid, fd = pty.fork()
+    if pid == 0:
+        os.environ["TERM"] = "xterm-ghostty"
+        os.environ["SLOSH_CONFIG"] = "/nonexistent/slosh.kdl"
+        os.execv(
+            BIN, [BIN, "-s", session or SESSION, "--", "python3", "-c", child or CHILD]
+        )
+        os._exit(127)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    return pid, fd
+
+
+def drain(fd, idle=0.4, limit=8.0):
+    buf, last, start = b"", time.time(), time.time()
+    while time.time() - start < limit:
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            last = time.time()
+        elif time.time() - last > idle:
+            break
+    return buf
+
+
+def unsynced(buf):
+    """kitty commands that reach the client outside a synchronized update.
+
+    A frame is a cell diff and then the placements that sit on top of it. A
+    terminal that presents the diff before the placements arrive draws the
+    cells under a picture with no picture on them, so every image blinks once
+    per frame -- which is what happens the moment anything re-chunks the
+    stream on the way out (a mirror reading the pty a few KB at a time). The
+    markers are what stop the halves being presented separately, so every
+    image command has to be inside a pair.
+    """
+    depth, out = 0, []
+    for m in re.finditer(rb"\x1b\[\?2026h|\x1b\[\?2026l|\x1b_G([^\x1b]*)\x1b", buf):
+        if m.group() == b"\x1b[?2026h":
+            depth += 1
+        elif m.group() == b"\x1b[?2026l":
+            depth -= 1
+        elif depth <= 0:
+            out.append(m.group(1)[:40])
+    return out
+
+
+def check(name, cond, detail=""):
+    print(f"{'ok  ' if cond else 'FAIL'} {name}{'' if cond else '  <- ' + detail}")
+    return cond
+
+
+def gfx_commands(buf):
+    """(controls, payload_len) for every _G escape in the stream."""
+    out = []
+    for m in re.finditer(rb"\x1b_G([^\x1b]*)\x1b", buf):
+        ctl, _, payload = m.group(1).partition(b";")
+        out.append((ctl, len(payload)))
+    return out
+
+
+def main():
+    ok = True
+    pid, fd = spawn()
+
+    # Say nothing, hear nothing: the child pours the image into its pty while
+    # the client's own output backs up unread, which is what a slow terminal
+    # over ssh looks like from the server's side.
+    time.sleep(4.0)
+    buf = drain(fd, idle=0.6, limit=30.0)
+
+    ok &= check(
+        "the display stayed attached through the flood",
+        os.waitpid(pid, os.WNOHANG) == (0, 0),
+        repr(buf[-120:]),
+    )
+
+    sent = 0
+    for ctl, n in gfx_commands(buf):
+        if b"a=t" in ctl or (b"a=" not in ctl and b"m=" in ctl):
+            sent += n
+    ok &= check(
+        "a transmission bigger than the outbox cap arrives whole",
+        sent >= (1100 * 1000 * 3 + 2) // 3 * 4,
+        f"{sent} bytes of base64 reached the client",
+    )
+    cmds = gfx_commands(buf)
+    placed = any(ctl.startswith(b"a=p") for ctl, _ in cmds)
+    ok &= check("and the image is placed while visible", placed, repr(buf[-300:]))
+
+    loose = unsynced(buf)
+    ok &= check(
+        "every image command travels inside a synchronized update",
+        not loose,
+        f"{len(loose)} outside: {loose[:4]}",
+    )
+
+    # The child's flood scrolled it away while nothing was being read: the
+    # deletion rode a frame the full outbox may well have dropped, and it must
+    # be said again until it lands -- or the client draws the placement at a
+    # fixed spot forever, which is exactly how this was reported.
+    deleted = any(ctl.startswith(b"a=d,d=i") for ctl, _ in cmds)
+    ok &= check("scrolled away, the placement is deleted", deleted, repr(buf[-300:]))
+
+    # Scrolling back up must re-place it, and from the transmission the client
+    # already has: no second copy of the pixels.
+    buf = b""
+    for _ in range(20):
+        os.write(fd, b"\x01\x1b[5~")  # C-a PageUp
+        buf += drain(fd, idle=0.1, limit=3.0)
+    buf += drain(fd, idle=0.4, limit=8.0)
+    back = [ctl for ctl, _ in gfx_commands(buf)]
+    ok &= check(
+        "scrolled back, it is placed again",
+        any(c.startswith(b"a=p") for c in back),
+        repr(buf[-300:]),
+    )
+    ok &= check(
+        "without retransmitting the pixels",
+        not any(c.startswith(b"a=t") for c in back),
+        str(back[:6]),
+    )
+
+    # A second terminal has its own kitty image namespace. The first client's
+    # `sent` bit must not make a new viewer receive only a placement for pixels
+    # its terminal has never seen.
+    pid2, fd2 = spawn()
+    second = drain(fd2, idle=0.6, limit=30.0)
+    second_cmds = gfx_commands(second)
+    ok &= check(
+        "a joining client receives its own image transmission",
+        any(c.startswith(b"a=t") for c, _ in second_cmds),
+        str(second_cmds[:8]),
+    )
+    ok &= check(
+        "and joining it leaves the first client attached",
+        os.waitpid(pid, os.WNOHANG) == (0, 0),
+    )
+
+    # A placement is a standing instruction, not a per-frame one: a picture
+    # that has not moved must not be re-sent while the screen around it
+    # repaints. Re-sending it is invisible on a terminal that keeps the pixels
+    # and ruinous on anything mirroring the stream, which re-decodes the image
+    # and rebuilds its view every time it hears the placement again.
+    pid3, fd3 = spawn(child=STILL, session=SESSION + "-still")
+    still = drain(fd3, idle=0.6, limit=20.0)
+    places = [ctl for ctl, _ in gfx_commands(still) if ctl.startswith(b"a=p")]
+    frames = still.count(b"\x1b[?2026h")
+    ok &= check(
+        "a still picture is placed once, however much repaints around it",
+        len(places) == 1 and frames > 10,
+        f"{len(places)} placements across {frames} frames",
+    )
+    os.kill(pid3, 9)
+
+    # The other edge of "place once": a retransmit invalidates every placement
+    # of the image (kitty deletes them all when the data is replaced), not
+    # just the one that rode in the same call as the transmit. Un-invalidated,
+    # the second placement is judged unchanged and never said again -- a
+    # picture the client deleted and we believe it still has.
+    pid4, fd4 = spawn(child=REPLACED, session=SESSION + "-replaced")
+    replaced = drain(fd4, idle=3.5, limit=20.0)
+    transmits = [m.start() for m in re.finditer(rb"\x1b_Ga=t,", replaced)]
+    replaces = (
+        [c for c, _ in gfx_commands(replaced[transmits[1] :]) if c.startswith(b"a=p")]
+        if len(transmits) >= 2
+        else []
+    )
+    ok &= check(
+        "a retransmit re-places every placement of the image",
+        len(transmits) >= 2 and len(replaces) == 2,
+        f"{len(transmits)} transmits, then {len(replaces)} placements: {replaces[:4]}",
+    )
+    os.kill(pid4, 9)
+
+    os.write(fd2, b"\x01q")
+    drain(fd2, idle=0.2, limit=2.0)
+    for child in (pid, pid2):
+        try:
+            os.kill(child, 9)
+        except ProcessLookupError:
+            pass
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

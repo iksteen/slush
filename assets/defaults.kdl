@@ -1,0 +1,192 @@
+// Runtime defaults for the Rust port, initially transcribed from slosh.
+//
+// Written by `slosh --dump-config`, so every value here is
+// the one in force rather than one somebody typed up. Delete
+// anything you do not want to pin; what is missing is a
+// default, and defaults are allowed to improve.
+//
+// The commented reference -- what each setting is for, and why
+// it exists -- is config/config.kdl in the source tree.
+
+// ---- geometry ----
+gap 1
+gap_aspect 2          // columns per row, so a gap looks square
+padding 0
+rounded true
+compact false            // shared 1-cell borders instead of gaps
+title_align "center"
+title_inset 2
+min_pane cols=24 rows=6   // below this a pane collapses
+min_split cols=32 rows=8  // below this a split is not offered
+
+// ---- what is on screen ----
+status_bar true          // the strip along the top
+tab_bar_side "top"     // top, or a sidebar: left / right
+tab_bar_index "right"  // the sidebar's number at its far edge, or 1:name
+tab_bar_width 18      // columns a sidebar takes, at most
+tab_bar_padding 0 1 0 2 // top right bottom left
+// tab_bar_pad 0       // the top of that alone, the older name for it
+tab_gap 0            // blank rows between a sidebar's tabs
+tab_bar_status 3     // pane status rows under each tab, 0 = off
+tab_bar_status_lines 1 // rows one status may wrap onto, 1 = cut it
+tab_bar_chrome true   // frame the sidebar like a pane
+status_line true         // the line along the bottom
+status_pad 4
+hints true               // what the pointer is on, in the middle
+version_banner true      // ...and which build this is, when idle
+pane_buttons true        // the marks in a frame's top-right
+bell_indicator true
+zoom_mark "□"
+zoom_on_mark "■"
+close_mark "✕"
+min_mark "▬"
+newtab_mark "+"
+newtab_button true       // the + at the end of the tab strip
+newtab_pad 1             // air before it: rows in a sidebar, columns on top
+bell_mark "[!]"
+busy_mark "⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏"  // a busy pane's spinner; one frame is a static mark
+busy_ms 120            // how long a spinner frame is held
+
+// ---- behaviour ----
+focus_follows_mouse true
+multi_attach true        // several terminals at once; off: a new client displaces the old
+attach_indicator true    // top-right tag when others are watching
+size_follows "active"  // or "smallest" / "largest"
+in_band_shaders false
+ctrl_d_exits false        // ^D at an idle prompt exits the shell; default on Windows only
+scroll_lines 3
+scrollback 10000           // lines of history per pane; 0 for none
+scrollback_bytes 16777216  // the ceiling that count runs into; 0 for none
+toast_ms 2500
+splash_ms 900          // the logo, on attach; 0 for never
+hover_delay_ms 250
+select_scroll_ms 50      // drag past an edge: ms per scroll step
+double_click_ms 400
+word_separators "\"'`()[]{}<>;,|"  // what a double-click's word stops at
+anim_ms 50             // frame clock while a shader animates
+modal_scrim 120         // how far a modal pushes the rest back
+dim_unfocused 60       // ...and how far the panes you are not in
+float_shadow 110       // the shade a floating pane casts; 0 for none
+keep_dead "commands"  // which dead panes stay: commands, all, none
+// shell "/bin/zsh"     // unset: $SHELL
+// editor "nvim"        // unset: $EDITOR, then vi
+// project_roots "~/dev" "~/work" depth=2
+// project_layout "~/.config/slosh/project.layout"
+
+// ---- colour ----
+// theme_dir "~/.config/slosh/themes"  // unset: themes/ beside this file,
+//                                     then the installed ones
+// theme_name "phosphor"  // unset: the compiled-in palette
+// theme { frame_focus "#00ff88" }  // ...and the colours you want anyway
+
+// ---- colour passes over every pane ----
+// (contrib/shaders has thirty-odd to paste; contrib/shadertoy.html
+//  previews them. where="chrome" runs a pass over the frame
+//  instead of the contents)
+shaders {
+}
+
+// ---- what a pane looks like in a given state ----
+states {
+    dragging {
+    }
+    drop_hover {
+        grayscale amount=200
+        dim amount=140
+    }
+    drop_target {
+        grayscale amount=200
+        dim amount=140
+    }
+    dead {
+        grayscale amount=200
+        dim amount=90
+    }
+    suspended {
+        grayscale amount=170
+        dim amount=60
+    }
+    // bell {   // derived: a body shimmer, and a frame blink-then-breathe, in theme's bell colour
+    //     tint amount="(since < 900) * max(0, 95 - abs(x + 2 * y - since / 4) * (6 + sin(since / 2) / 96) - since / 64)" color="#efd7b3"
+    //     tint amount="since < 900 ? (since / 150 % 2 == 0) * 255 : 120 + sin(since / 8 + 158) / 3" color="#e0af68" where="chrome" channel="fg"
+    // }
+    // scrolled {   // derived: a wash of theme's scroll_bg, and edge fades where more content is
+    //     tint amount=22 color="#7aa2f7"
+    //     dim amount="(above > 0) * max(0, (min(4, rows / 4) - y) * 60)"
+    //     dim amount="(below > 0) * max(0, (y - rows + min(4, rows / 4) + 1) * 60)"
+    // }
+    floating {
+    }
+    // unfocused {   // derived: the dim_unfocused knob above
+    //     dim amount=60
+    // }
+}
+
+// ---- keys ----
+keys {
+    prefix "ctrl+a"
+
+    bind "enter" "split"
+    bind "backslash" "split-cols"
+    bind "minus" "split-rows"
+    bind "x" "close-pane"
+    bind "shift+slash" "help"
+    bind "slash" "search"
+    bind "r" "rerun"
+    bind "z" "zoom"
+    bind "e" "edit-config"
+    bind "m" "minimize"
+    bind "f" "float"
+    bind "h" "focus-left"
+    bind "l" "focus-right"
+    bind "k" "focus-up"
+    bind "j" "focus-down"
+    bind "left" "focus-left"
+    bind "right" "focus-right"
+    bind "up" "focus-up"
+    bind "down" "focus-down"
+    bind "o" "focus-next"
+    bind "shift+h" "resize-left"
+    bind "shift+l" "resize-right"
+    bind "shift+k" "resize-up"
+    bind "shift+j" "resize-down"
+    bind "shift+left" "resize-left"
+    bind "shift+right" "resize-right"
+    bind "shift+up" "resize-up"
+    bind "shift+down" "resize-down"
+    bind "=" "float-grow"
+    bind "shift+=" "float-grow"
+    bind "0" "equalize"
+    bind "shift+f" "new-float"
+    bind "space" "rotate-layout"
+    bind "shift+period" "pane-to-next-tab"
+    bind "shift+comma" "pane-to-prev-tab"
+    bind "period" "pane-to-next-tab"
+    bind "comma" "pane-to-prev-tab"
+    bind "b" "pane-to-new-tab"
+    bind "c" "new-tab"
+    bind "shift+x" "close-tab"
+    bind "tab" "next-tab"
+    bind "shift+tab" "prev-tab"
+    bind "w" "workspaces"
+    bind "shift+w" "save-workspace"
+    bind "s" "finder"
+    bind "t" "themes"
+    bind "p" "palette"
+    bind "shift+p" "set-purpose"
+    bind "pageup" "scroll-page-up"
+    bind "pagedown" "scroll-page-down"
+    bind "home" "scroll-top"
+    bind "end" "scroll-bottom"
+    bind "d" "detach"
+    bind "q" "quit"
+    bind "1" "select-tab-1"
+    bind "2" "select-tab-2"
+    bind "3" "select-tab-3"
+    bind "4" "select-tab-4"
+    bind "5" "select-tab-5"
+    bind "6" "select-tab-6"
+    bind "7" "select-tab-7"
+    bind "8" "select-tab-8"
+    bind "9" "select-tab-9"
+}

@@ -1,0 +1,27 @@
+{
+  "upstream": "https://github.com/sl0p-foo/slosh",
+  "source_commit": "d04228e9124eca3117843dfb5dfcf531d2107d07",
+  "version": "0.1.8",
+  "notes": "Selected test-only C oracles, unit suites, behavioral Python suites, fuzz seeds, and shader test fixtures. No C application, build system, website, documentation generator, agent skill, or release tooling.",
+  "c_modules": [
+    "config",
+    "kdl",
+    "path",
+    "expr",
+    "shader",
+    "screen",
+    "json",
+    "graphics",
+    "osc5577"
+  ],
+  "excluded_suites": [
+    "test_docs.py",
+    "test_shader_repl.py",
+    "test_skill.py"
+  ],
+  "excluded_source_checks": {
+    "test_portable_layouts.py": [
+      "test_the_layout_property_lists_cannot_go_stale"
+    ]
+  }
+}

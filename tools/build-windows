@@ -1,0 +1,8 @@
+#!/bin/sh
+# Cross-build using MinGW's runtime and LLD's COFF weak-symbol support.
+# Prerequisites: Zig 0.16, x86_64-w64-mingw32-gcc, ld.lld, and the Rust
+# x86_64-pc-windows-gnu target. Any supplied Cargo arguments are forwarded.
+set -eu
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS:-} -C link-arg=-fuse-ld=lld"
+exec cargo build --offline --manifest-path "$project_dir/Cargo.toml" --target x86_64-pc-windows-gnu "$@"
